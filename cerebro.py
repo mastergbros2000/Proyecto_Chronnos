@@ -8,34 +8,44 @@ from google.genai import types
 from PIL import Image
 
 from openai import OpenAI
+import cohere
+from huggingface_hub import InferenceClient
 
 from control_sistema import abrir_aplicacion, escribir_texto 
 from vision import capturar_imagen
 
 load_dotenv() 
 
-# Cargamos las credenciales
+# Cargamos las credenciales 100% gratuitas
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+GITHUB_MODELS_API_KEY = os.getenv("GITHUB_MODELS_API_KEY")
+SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY") # <- NUEVA CLAVE
 
 # Inicializamos los clientes
-client_gemini = genai.Client(api_key=GOOGLE_API_KEY)
+client_gemini = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
-client_deepseek = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
-) if DEEPSEEK_API_KEY else None
-
-# Cliente universal de OpenRouter (apunta a su pasarela)
 client_openrouter = OpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1"
 ) if OPENROUTER_API_KEY else None
 
-# Modelos gratuitos de Gemini para el enrutador de complejidad
-MODELO_RAPIDO = "gemini-1.5-flash"
-MODELO_COMPLEJO = "gemini-1.5-pro"
+client_cohere = cohere.ClientV2(COHERE_API_KEY) if COHERE_API_KEY else None
+
+client_hf = InferenceClient(api_key=HUGGINGFACE_API_KEY) if HUGGINGFACE_API_KEY else None
+
+client_github = OpenAI(
+    api_key=GITHUB_MODELS_API_KEY,
+    base_url="https://models.inference.ai.azure.com"
+) if GITHUB_MODELS_API_KEY else None
+
+# Inicializamos SambaNova
+client_sambanova = OpenAI(
+    api_key=SAMBANOVA_API_KEY,
+    base_url="https://api.sambanova.ai/v1"
+) if SAMBANOVA_API_KEY else None
 
 modo_reposo = False
 hora_despertar = None
@@ -54,41 +64,19 @@ class RespuestaFalsa:
 # ==========================================
 # CONEXIONES DE APIS
 # ==========================================
-def llamar_api_gemini(contenido_a_enviar, config_herramientas, modelo=MODELO_RAPIDO):
-    """Llama a Gemini permitiendo elegir entre Flash (rápido) y Pro (complejo)."""
+def llamar_api_gemini(contenido_a_enviar, config_herramientas, modelo):
+    if not client_gemini:
+        raise Exception("API Key de Gemini no configurada")
     return client_gemini.models.generate_content(
         model=modelo, 
         contents=contenido_a_enviar,
         config=config_herramientas
     )
 
-def llamar_api_deepseek(contenido_a_enviar, config_herramientas):
-    """Mantenemos la función de DeepSeek por si le agregas saldo a la API en el futuro."""
-    if not client_deepseek:
-        raise Exception("API Key de DeepSeek no configurada")
-    
-    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
-    
-    respuesta = client_deepseek.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "user", "content": texto_prompt}],
-        stream=False
-    )
-    
-    class AdaptadorRespuestaDeepSeek:
-        def __init__(self, texto):
-            self.text = texto
-            self.function_calls = None
-            
-    return AdaptadorRespuestaDeepSeek(respuesta.choices[0].message.content)
-
-def llamar_api_openrouter(contenido_a_enviar, config_herramientas, modelo="openrouter/free"):
-    """Llama a modelos 100% gratuitos a través de OpenRouter."""
+def llamar_api_openrouter(contenido_a_enviar, config_herramientas, modelo):
     if not client_openrouter:
         raise Exception("API Key de OpenRouter no configurada")
-    
     texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
-    
     respuesta = client_openrouter.chat.completions.create(
         model=modelo, 
         messages=[
@@ -97,43 +85,149 @@ def llamar_api_openrouter(contenido_a_enviar, config_herramientas, modelo="openr
         ],
         stream=False
     )
-    
     class AdaptadorRespuestaOpenRouter:
         def __init__(self, texto):
             self.text = texto
             self.function_calls = None
-            
     return AdaptadorRespuestaOpenRouter(respuesta.choices[0].message.content)
+
+def llamar_api_cohere(contenido_a_enviar, config_herramientas, modelo):
+    if not client_cohere:
+        raise Exception("API Key de Cohere no configurada")
+    
+    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
+    respuesta = client_cohere.chat(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": memoria_conversacion},
+            {"role": "user", "content": texto_prompt}
+        ]
+    )
+    class AdaptadorRespuestaCohere:
+        def __init__(self, texto):
+            self.text = texto
+            self.function_calls = None
+    return AdaptadorRespuestaCohere(respuesta.message.content[0].text)
+
+def llamar_api_huggingface(contenido_a_enviar, config_herramientas, modelo):
+    if not client_hf:
+        raise Exception("API Key de Hugging Face no configurada")
+    
+    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
+    
+    respuesta = client_hf.chat_completion(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": memoria_conversacion},
+            {"role": "user", "content": texto_prompt}
+        ],
+        max_tokens=800
+    )
+    
+    class AdaptadorRespuestaHF:
+        def __init__(self, texto):
+            self.text = texto
+            self.function_calls = None
+            
+    return AdaptadorRespuestaHF(respuesta.choices[0].message.content)
+
+def llamar_api_github(contenido_a_enviar, config_herramientas, modelo):
+    if not client_github:
+        raise Exception("API Key de GitHub Models no configurada")
+    
+    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
+    
+    respuesta = client_github.chat.completions.create(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": memoria_conversacion},
+            {"role": "user", "content": texto_prompt}
+        ],
+        stream=False
+    )
+    
+    class AdaptadorRespuestaGitHub:
+        def __init__(self, texto):
+            self.text = texto
+            self.function_calls = None
+            
+    return AdaptadorRespuestaGitHub(respuesta.choices[0].message.content)
+
+# NUEVA FUNCIÓN PARA SAMBANOVA
+def llamar_api_sambanova(contenido_a_enviar, config_herramientas, modelo):
+    if not client_sambanova:
+        raise Exception("API Key de SambaNova no configurada")
+    
+    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
+    
+    respuesta = client_sambanova.chat.completions.create(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": memoria_conversacion},
+            {"role": "user", "content": texto_prompt}
+        ],
+        stream=False
+    )
+    
+    class AdaptadorRespuestaSambaNova:
+        def __init__(self, texto):
+            self.text = texto
+            self.function_calls = None
+            
+    return AdaptadorRespuestaSambaNova(respuesta.choices[0].message.content)
 
 # ==========================================
 # EL COORDINADOR MULTI-API (ENRUTADOR INTELIGENTE)
 # ==========================================
 def analizar_complejidad(texto_prompt):
-    """Decide automáticamente qué modelo de Gemini usar según la complejidad."""
     palabras_clave_complejas = ["analiza", "profundidad", "informe", "código", "programa", "resume", "compara", "explica"]
     texto_min = str(texto_prompt).lower()
-    
     for palabra in palabras_clave_complejas:
         if palabra in texto_min:
-            return MODELO_COMPLEJO # Tarea difícil -> Usar Gemini 1.5 Pro
-            
-    return MODELO_RAPIDO # Tarea fácil -> Usar Gemini 1.5 Flash
+            return "COMPLEJO" 
+    return "RAPIDO"
 
 def generar_con_respaldo(contenido_a_enviar, config_herramientas):
     texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
     
-    # 1. Enrutamiento automático por complejidad
-    modelo_gemini_elegido = analizar_complejidad(texto_prompt)
-    print(f"\n[Cerebro Coordinador: Evaluando complejidad... Asignado a {modelo_gemini_elegido}]")
+    nivel_complejidad = analizar_complejidad(texto_prompt)
+    print(f"\n[Cerebro Coordinador: Nivel de complejidad evaluado -> {nivel_complejidad}]")
     
-    # 2. Lista de APIs a probar (100% Gratuitas)
-    apis_a_probar = [
-        {"nombre": f"Gemini ({modelo_gemini_elegido})", "funcion": lambda cont, conf: llamar_api_gemini(cont, conf, modelo_gemini_elegido)},
-        {"nombre": "OpenRouter Automático (:free)", "funcion": lambda cont, conf: llamar_api_openrouter(cont, conf, "openrouter/free")},
-        {"nombre": "Gemma (vía OpenRouter)", "funcion": lambda cont, conf: llamar_api_openrouter(cont, conf, "google/gemma-4-31b-it:free")}
-    ]
+    if nivel_complejidad == "COMPLEJO":
+        modelo_sambanova = "Meta-Llama-3.1-405B-Instruct" # Modelo masivo para tareas hiper complejas
+        modelo_github = "gpt-4o" 
+        modelo_gemini = "gemini-1.5-pro"
+        modelo_cohere = "command-r-plus-08-2024"
+        modelo_openrouter = "google/gemma-4-31b-it:free"
+        modelo_hf = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+        
+        # Prioridad para tareas complejas: SambaNova -> GitHub -> Gemini
+        apis_a_probar = [
+            {"nombre": f"SambaNova ({modelo_sambanova})", "funcion": lambda cont, conf: llamar_api_sambanova(cont, conf, modelo_sambanova)},
+            {"nombre": f"GitHub Models ({modelo_github})", "funcion": lambda cont, conf: llamar_api_github(cont, conf, modelo_github)},
+            {"nombre": f"Gemini ({modelo_gemini})", "funcion": lambda cont, conf: llamar_api_gemini(cont, conf, modelo_gemini)},
+            {"nombre": f"Cohere ({modelo_cohere})", "funcion": lambda cont, conf: llamar_api_cohere(cont, conf, modelo_cohere)},
+            {"nombre": f"OpenRouter ({modelo_openrouter})", "funcion": lambda cont, conf: llamar_api_openrouter(cont, conf, modelo_openrouter)},
+            {"nombre": f"Hugging Face ({modelo_hf})", "funcion": lambda cont, conf: llamar_api_huggingface(cont, conf, modelo_hf)}
+        ]
+    else:
+        modelo_github = "gpt-4o-mini" 
+        modelo_gemini = "gemini-1.5-flash"
+        modelo_sambanova = "Meta-Llama-3.1-8B-Instruct" # Modelo ligero y ultra rápido
+        modelo_openrouter = "openrouter/free" 
+        modelo_cohere = "command-r-08-2024" 
+        modelo_hf = "mistralai/Mistral-7B-Instruct-v0.3" 
+        
+        # Prioridad para tareas rápidas: GitHub -> Gemini -> SambaNova
+        apis_a_probar = [
+            {"nombre": f"GitHub Models ({modelo_github})", "funcion": lambda cont, conf: llamar_api_github(cont, conf, modelo_github)},
+            {"nombre": f"Gemini ({modelo_gemini})", "funcion": lambda cont, conf: llamar_api_gemini(cont, conf, modelo_gemini)},
+            {"nombre": f"SambaNova ({modelo_sambanova})", "funcion": lambda cont, conf: llamar_api_sambanova(cont, conf, modelo_sambanova)},
+            {"nombre": f"OpenRouter ({modelo_openrouter})", "funcion": lambda cont, conf: llamar_api_openrouter(cont, conf, modelo_openrouter)},
+            {"nombre": f"Cohere ({modelo_cohere})", "funcion": lambda cont, conf: llamar_api_cohere(cont, conf, modelo_cohere)},
+            {"nombre": f"Hugging Face ({modelo_hf})", "funcion": lambda cont, conf: llamar_api_huggingface(cont, conf, modelo_hf)}
+        ]
     
-    # 3. Tolerancia a fallos: Intenta cada una hasta tener éxito
     for api in apis_a_probar:
         print(f"[Coordinador: Intentando procesar con {api['nombre']}...]")
         try:
@@ -141,7 +235,6 @@ def generar_con_respaldo(contenido_a_enviar, config_herramientas):
             print(f"[Coordinador: ¡Éxito con {api['nombre']}!]")
             return respuesta
         except Exception as e:
-            # Corregido el salto de línea que generaba el error de sintaxis
             print(f"[Coordinador: Fallo en {api['nombre']} - {str(e)}]")
             
-    return RespuestaFalsa("Lo siento, todas mis conexiones gratuitas fallaron en este momento.")
+    return RespuestaFalsa("Lo siento, todas mis conexiones a los diferentes cerebros han fallado en este momento.")
