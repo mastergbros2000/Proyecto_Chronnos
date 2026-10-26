@@ -22,7 +22,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 GITHUB_MODELS_API_KEY = os.getenv("GITHUB_MODELS_API_KEY")
-SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY") # <- NUEVA CLAVE
+SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY")
 
 # Inicializamos los clientes
 client_gemini = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
@@ -153,7 +153,6 @@ def llamar_api_github(contenido_a_enviar, config_herramientas, modelo):
             
     return AdaptadorRespuestaGitHub(respuesta.choices[0].message.content)
 
-# NUEVA FUNCIÓN PARA SAMBANOVA
 def llamar_api_sambanova(contenido_a_enviar, config_herramientas, modelo):
     if not client_sambanova:
         raise Exception("API Key de SambaNova no configurada")
@@ -194,14 +193,13 @@ def generar_con_respaldo(contenido_a_enviar, config_herramientas):
     print(f"\n[Cerebro Coordinador: Nivel de complejidad evaluado -> {nivel_complejidad}]")
     
     if nivel_complejidad == "COMPLEJO":
-        modelo_sambanova = "Meta-Llama-3.1-405B-Instruct" # Modelo masivo para tareas hiper complejas
+        modelo_sambanova = "Meta-Llama-3.1-405B-Instruct" 
         modelo_github = "gpt-4o" 
         modelo_gemini = "gemini-1.5-pro"
         modelo_cohere = "command-r-plus-08-2024"
         modelo_openrouter = "google/gemma-4-31b-it:free"
         modelo_hf = "mistralai/Mixtral-8x7B-Instruct-v0.1"
         
-        # Prioridad para tareas complejas: SambaNova -> GitHub -> Gemini
         apis_a_probar = [
             {"nombre": f"SambaNova ({modelo_sambanova})", "funcion": lambda cont, conf: llamar_api_sambanova(cont, conf, modelo_sambanova)},
             {"nombre": f"GitHub Models ({modelo_github})", "funcion": lambda cont, conf: llamar_api_github(cont, conf, modelo_github)},
@@ -213,12 +211,11 @@ def generar_con_respaldo(contenido_a_enviar, config_herramientas):
     else:
         modelo_github = "gpt-4o-mini" 
         modelo_gemini = "gemini-1.5-flash"
-        modelo_sambanova = "Meta-Llama-3.1-8B-Instruct" # Modelo ligero y ultra rápido
+        modelo_sambanova = "Meta-Llama-3.1-8B-Instruct" 
         modelo_openrouter = "openrouter/free" 
         modelo_cohere = "command-r-08-2024" 
         modelo_hf = "mistralai/Mistral-7B-Instruct-v0.3" 
         
-        # Prioridad para tareas rápidas: GitHub -> Gemini -> SambaNova
         apis_a_probar = [
             {"nombre": f"GitHub Models ({modelo_github})", "funcion": lambda cont, conf: llamar_api_github(cont, conf, modelo_github)},
             {"nombre": f"Gemini ({modelo_gemini})", "funcion": lambda cont, conf: llamar_api_gemini(cont, conf, modelo_gemini)},
@@ -233,6 +230,11 @@ def generar_con_respaldo(contenido_a_enviar, config_herramientas):
         try:
             respuesta = api["funcion"](contenido_a_enviar, config_herramientas)
             print(f"[Coordinador: ¡Éxito con {api['nombre']}!]")
+            
+            # FILTRO ANTI-ALUCINACIONES DE ERRORES EN INGLÉS
+            if "user safety: safe" in respuesta.text.lower():
+                return RespuestaFalsa("Lo siento, mi red neuronal de respaldo bloqueó la respuesta por un falso positivo de seguridad. Intenta preguntarme de otra forma.")
+                
             return respuesta
         except Exception as e:
             print(f"[Coordinador: Fallo en {api['nombre']} - {str(e)}]")
