@@ -23,17 +23,19 @@ try:
                     break
                 
                 comando_min = comando.lower()
-                    
-                if "apagar sistema" in comando_min:
+                
+                # Lista flexible de apagado total del programa
+                palabras_apagar = ["apaga", "apagar", "desconectar", "desconecta", "desconéctate", "salir", "finalizar"]
+                es_orden_apagar = any(p in comando_min for p in palabras_apagar)
+                no_es_cerrar_app = not any(app in comando_min for app in ["ventana", "calculadora", "bloc", "pestana", "pestaña"])
+                
+                if es_orden_apagar and no_es_cerrar_app:
                     hablar("Desconectando el sistema. Hasta luego.")
-                    # 1. Damos tiempo para que termine de hablar
                     time.sleep(3.5)
-                    # 2. Apagamos el motor de audio a la fuerza
                     pygame.mixer.quit()
-                    # 3. Cerramos Python de forma absoluta
                     sys.exit(0)
                     
-                comandos_dormir = ["descansa", "eso es todo", "gracias", "duerme", "adiós"]
+                comandos_dormir = ["descansa", "eso es todo", "gracias", "duerme", "adiós", "adios"]
                 if any(palabra in comando_min for palabra in comandos_dormir):
                     hablar("De acuerdo, me quedo en segundo plano.")
                     break 
