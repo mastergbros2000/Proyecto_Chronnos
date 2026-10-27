@@ -1,5 +1,5 @@
 from audio import hablar, escuchar
-from cerebro import generar_con_respaldo
+from cerebro import procesar_respuesta
 import sys
 import pygame
 import time
@@ -40,8 +40,8 @@ try:
                     
                 print("[Chronnos está pensando...]")
                 
-                respuesta = generar_con_respaldo(comando, None)
-                hablar(respuesta.text)
+                respuesta_texto = procesar_respuesta(comando)
+                hablar(respuesta_texto)
                 
             print("\n[Volviendo al modo reposo... Esperando a 'Chronnos']")
 
