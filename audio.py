@@ -1,150 +1,157 @@
 import speech_recognition as sr
-import edge_tts
-import asyncio
-import os
-import threading
-import time
 import pygame
-import uuid
+import io
+import asyncio
+import edge_tts
+import re
 
-# Inicializamos el motor de audio de forma segura
+# Inicializamos el mezclador de Pygame para audio directo en memoria RAM
 pygame.mixer.init()
 
-hablando_actualmente = False
-parar_audio = False
-texto_actual_voz = ""
+reproduciendo_audio = False
+interrupcion_solicitada = False
 
-async def _generar_y_reproducir_audio(texto_limpio):
-    global hablando_actualmente, parar_audio
-    # Generamos un archivo único para evitar el error "Permission denied"
-    archivo_unico = f"voz_{uuid.uuid4().hex[:8]}.mp3"
+def restaurar_puntuacion(texto: str) -> str:
+    """
+    Analiza la transcripción del micrófono e inserta signos de interrogación (¿?) 
+    únicamente si la frase es verdaderamente una pregunta.
+    """
+    if not texto:
+        return ""
+    
+    texto = texto.strip()
+    texto_lower = texto.lower()
+    
+    # Comandos explícitos de acción (NUNCA son preguntas)
+    ordenes_imperativas = ("abre", "busca", "pon", "escribe", "haz", "reproduce", "cierra", "ejecuta", "inicia")
+    es_orden = texto_lower.startswith(ordenes_imperativas)
+    
+    # Palabras que inician una pregunta real al comienzo de la frase
+    inicio_pregunta = (
+        "qué ", "que ", "cómo ", "como ", "cuál ", "cual ", "cuánto ", "cuanto ",
+        "dónde ", "donde ", "quién ", "quien ", "por qué ", "porque ", "puedes ",
+        "podrías ", "sabes ", "sería ", "es ", "cuánto ", "cuanto "
+    )
+    
+    es_pregunta = not es_orden and (
+        texto_lower.startswith(inicio_pregunta) or 
+        texto_lower.endswith(("?", "cuánto", "cuanto"))
+    )
+    
+    # Inserción de comas en conectores
+    conectores = [r"\bpero\b", r"\bademás\b", r"\bsin embargo\b", r"\bya que\b", r"\bporque\b", r"\baunque\b"]
+    for conector in conectores:
+        texto = re.sub(rf"(?<!,)\s+({conector.replace(r'\b', '')})", r", \1", texto, flags=re.IGNORECASE)
+        
+    # Primera letra en mayúscula
+    texto = texto[0].upper() + texto[1:]
+    
+    if es_pregunta and not texto.endswith("?"):
+        if not texto.startswith("¿"):
+            texto = "¿" + texto
+        texto = texto.rstrip(".") + "?"
+    elif not es_pregunta and not texto.endswith((".", "?", "!")):
+        texto += "."
+            
+    return texto
+
+async def _generar_bytes_voz(texto: str, voz: str = "es-CL-LorenzoNeural") -> io.BytesIO:
+    """Sintetiza la voz mediante Edge-TTS en un buffer de memoria RAM (BytesIO)."""
+    texto_limpio = texto.replace("*", "").replace("#", "").replace("`", "")
+    communicate = edge_tts.Communicate(texto_limpio, voz)
+    
+    buffer = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buffer.write(chunk["data"])
+            
+    buffer.seek(0)
+    return buffer
+
+def hablar(texto: str, voz: str = "es-CL-LorenzoNeural"):
+    """
+    Sintetiza y reproduce la voz desde la memoria RAM.
+    Permite interrupción instantánea si el usuario habla encima.
+    """
+    global reproduciendo_audio, interrupcion_solicitada
+    interrupcion_solicitada = False
+    
+    if not texto or not texto.strip():
+        return
+
+    print(f"Chronnos: {texto}")
     
     try:
-        voz_seleccionada = "es-ES-AlvaroNeural" 
-        comunicador = edge_tts.Communicate(texto_limpio, voz_seleccionada)
-        await comunicador.save(archivo_unico)
+        # Generar audio en memoria RAM usando asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        buffer_audio = loop.run_until_complete(_generar_bytes_voz(texto, voz))
+        loop.close()
         
-        if os.path.exists(archivo_unico) and not parar_audio:
-            pygame.mixer.music.load(archivo_unico)
-            pygame.mixer.music.play()
-            
-            # Mantenemos el hilo vivo mientras habla
-            while pygame.mixer.music.get_busy():
-                if parar_audio:
-                    pygame.mixer.music.stop()
-                    break
-                time.sleep(0.1)
-            
-            # Liberamos el archivo de la memoria de forma segura
-            try: pygame.mixer.music.unload()
-            except: pass
-            
-            # Intentamos limpiar el archivo del disco
-            try: os.remove(archivo_unico)
-            except: pass
+        # Cargar en el reproductor de Pygame
+        pygame.mixer.music.load(buffer_audio)
+        pygame.mixer.music.play()
+        reproduciendo_audio = True
+        
+        # Bucle de monitoreo para corte inmediato por voz
+        while pygame.mixer.music.get_busy():
+            if interrupcion_solicitada:
+                pygame.mixer.music.stop()
+                print("\n[Hablar: Reproducción interrumpida por voz del usuario]")
+                break
+            pygame.time.wait(30)
             
     except Exception as e:
-        print(f"[Error en motor de voz neuronal: {e}]")
+        print(f"[Error de Voz TTS]: {e}")
     finally:
-        hablando_actualmente = False
-        parar_audio = False
+        reproduciendo_audio = False
 
-def hablar(texto):
-    """Inicia la síntesis de voz en un hilo separado (Asíncrono)."""
-    global hablando_actualmente, parar_audio, texto_actual_voz
-    
-    if hablando_actualmente:
-        parar_audio = True
-        pygame.mixer.music.stop()
-        try: pygame.mixer.music.unload()
-        except: pass
-        threading.Event().wait(0.2)
+def detener_habla():
+    """Cancela inmediatamente la reproducción de audio actual."""
+    global interrupcion_solicitada
+    interrupcion_solicitada = True
+    pygame.mixer.music.stop()
 
-    texto_limpio = texto.replace("*", "").replace("#", "")
-    print(f"Chronnos: {texto_limpio}")
-    
-    texto_actual_voz = texto_limpio.lower()
-    hablando_actualmente = True
-    parar_audio = False
-    
-    def correr_async():
-        asyncio.run(_generar_y_reproducir_audio(texto_limpio))
-
-    # Ejecución asíncrona mediante hilos
-    hilo_voz = threading.Thread(target=correr_async)
-    hilo_voz.daemon = True
-    hilo_voz.start()
-
-def _es_eco(texto_escuchado, texto_dicho):
-    """Filtro inteligente para ignorar la propia voz de Chronnos por los altavoces."""
-    escuchado_limpio = texto_escuchado.replace(",", "").replace(".", "").lower()
-    dicho_limpio = texto_dicho.replace(",", "").replace(".", "").lower()
-    
-    if escuchado_limpio in dicho_limpio:
-        return True
-        
-    palabras_escuchadas = escuchado_limpio.split()
-    palabras_dichas = dicho_limpio.split()
-    variantes_nombre = ["chrono", "kronno", "chronos", "chronnos", "crono", "soy", "hola"]
-    
-    coincidencias = sum(1 for p in palabras_escuchadas if p in palabras_dichas or p in variantes_nombre)
-    if len(palabras_escuchadas) > 0 and (coincidencias / len(palabras_escuchadas)) >= 0.5:
-        return True
-    return False
-
-def _escuchar_interrupcion(reconocedor, fuente):
-    """Vigila el micrófono mientras Chronnos está hablando."""
-    global hablando_actualmente, parar_audio, texto_actual_voz
-    time.sleep(0.8) # Pequeño respiro inicial
-    
-    while hablando_actualmente:
-        try:
-            audio_interrupcion = reconocedor.listen(fuente, timeout=0.3, phrase_time_limit=2.0)
-            texto_interrupcion = reconocedor.recognize_google(audio_interrupcion, language="es-ES").lower()
-            
-            if texto_interrupcion.strip():
-                if _es_eco(texto_interrupcion, texto_actual_voz):
-                    continue 
-                
-                print(f"\n[Interrupción detectada con orden nueva]: {texto_interrupcion}")
-                parar_audio = True
-                pygame.mixer.music.stop()
-                try: pygame.mixer.music.unload()
-                except: pass
-                hablando_actualmente = False
-                return texto_interrupcion
-        except:
-            continue
-    return None
-
-def escuchar(silencioso=False):
-    """Maneja la entrada del micrófono optimizada."""
-    global hablando_actualmente
+def escuchar(silencioso=False) -> str | None:
+    """
+    Escucha el micrófono con optimización de latencia, cancelación de interrupción 
+    y formateo de puntuación automático.
+    """
+    global reproduciendo_audio
     reconocedor = sr.Recognizer()
-    reconocedor.pause_threshold = 0.8 # Respiro ajustado para que no te corte
+    
+    # Latencia ultra baja
+    reconocedor.pause_threshold = 0.7
+    reconocedor.non_speaking_duration = 0.4
     
     with sr.Microphone() as fuente:
-        reconocedor.adjust_for_ambient_noise(fuente, duration=0.4)
+        # Calibración veloz del ruido ambiente
+        reconocedor.adjust_for_ambient_noise(fuente, duration=0.3)
         reconocedor.dynamic_energy_threshold = False
-        reconocedor.energy_threshold = 280 
+        reconocedor.energy_threshold = 300 
+        
+        if not silencioso:
+            print("\n[Escuchando... Ya puedes hablar]")
         
         try:
-            while True:
-                if hablando_actualmente:
-                    resultado_interrupcion = _escuchar_interrupcion(reconocedor, fuente)
-                    if resultado_interrupcion:
-                        return resultado_interrupcion
-                else:
-                    if not silencioso:
-                        print("\n[Escuchando... Ya puedes hablar]")
-                    
-                    audio = reconocedor.listen(fuente, timeout=6, phrase_time_limit=12)
-                    texto = reconocedor.recognize_google(audio, language="es-ES")
-                    if not silencioso:
-                        print(f"Tú: {texto}")
-                    return texto.lower()
-                    
-        except sr.WaitTimeoutError:
+            audio = reconocedor.listen(fuente, timeout=5, phrase_time_limit=15)
+            
+            # Si estabas hablando mientras Chronnos daba su respuesta, la detiene al instante
+            if reproduciendo_audio:
+                detener_habla()
+                
+            texto_bruto = reconocedor.recognize_google(audio, language="es-ES")
+            
+            # Aplicamos la estructuración automática de puntuación
+            texto_procesado = restaurar_puntuacion(texto_bruto)
+            
+            if not silencioso and texto_procesado:
+                print(f"Tú: {texto_procesado}")
+                
+            return texto_procesado
+            
+        except (sr.WaitTimeoutError, sr.UnknownValueError):
             return None
-        except Exception:
+        except sr.RequestError:
+            print("[Error de conexión en el micrófono]")
             return None
