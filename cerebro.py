@@ -14,13 +14,15 @@ from openai import OpenAI
 import cohere
 from huggingface_hub import InferenceClient
 
+# Módulos locales de herramientas
 from control_sistema import abrir_aplicacion, escribir_texto, presionar_tecla, cerrar_ventana
-from navegador_web import (
-    buscar_y_reproducir_youtube, 
-    buscar_mercadolibre, 
-    navegar_a_url, 
-    hacer_clic_web, 
-    escribir_y_buscar_web
+from navegador_web import buscar_y_reproducir_youtube, buscar_mercadolibre
+from gestor_archivos import (
+    buscar_archivo_en_disco,
+    explorar_carpeta,
+    leer_archivo_local,
+    crear_o_modificar_archivo,
+    comparar_archivos_locales
 )
 
 load_dotenv() 
@@ -47,15 +49,13 @@ hora_despertar = None
 penalizaciones_api = {}
 TIEMPO_CASTIGO = 20 
 
+# System prompt reforzado contra alucinaciones de archivos
 memoria_conversacion = (
-    "Eres Chronnos, un agente de Inteligencia Artificial capaz de controlar aplicaciones locales y navegar de forma autónoma e interactiva por cualquier sitio web. "
-    "Responde siempre de forma natural, directa y muy humana. "
-    "REGLAS PARA NAVEGACIÓN WEB: "
-    "1. Si te piden ir a cualquier sitio web o foro (ej: Wikipedia, Reddit, noticias), usa 'navegar_a_url'. "
-    "2. Si te piden hacer clic en un enlace o botón visible, usa 'hacer_clic_web'. "
-    "3. Si te piden buscar o escribir algo en la página activa, usa 'escribir_y_buscar_web'. "
-    "4. Para reproducciones directas en YouTube usa 'buscar_y_reproducir_youtube' y para compras 'buscar_mercadolibre'. "
-    "NUNCA simules en texto que usaste una herramienta si no la has ejecutado explícitamente.\n\n"
+    "Eres Chronnos, un agente de IA que controla aplicaciones y explora el sistema de archivos local. "
+    "Responde siempre en español de forma natural, directa y concisa.\n"
+    "REGLA ESTRICTA DE ARCHIVOS: JAMÁS inventes ni alucines el contenido de una carpeta o archivo. "
+    "Menciona ÚNICAMENTE los elementos que figuren explícitamente en las respuestas del sistema. "
+    "Si encuentras la ruta de una carpeta y el usuario quiere saber qué contiene, DEBES llamar a 'explorar_carpeta' antes de responder.\n\n"
 )
 
 class RespuestaFalsa:
@@ -66,14 +66,16 @@ class RespuestaFalsa:
 def _convertir_herramientas_a_json():
     return [
         {"type": "function", "function": {"name": "abrir_aplicacion", "description": "Abre una aplicacion basica en Windows.", "parameters": {"type": "object", "properties": {"aplicacion": {"type": "string"}}, "required": ["aplicacion"]}}},
-        {"type": "function", "function": {"name": "escribir_texto", "description": "Escribe texto o numeros en la aplicacion activa de Windows.", "parameters": {"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]}}},
-        {"type": "function", "function": {"name": "presionar_tecla", "description": "Presiona una tecla especial (ej: enter, tab, esc).", "parameters": {"type": "object", "properties": {"tecla": {"type": "string"}}, "required": ["tecla"]}}},
+        {"type": "function", "function": {"name": "escribir_texto", "description": "Escribe texto o numeros en la aplicacion activa.", "parameters": {"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]}}},
+        {"type": "function", "function": {"name": "presionar_tecla", "description": "Presiona una tecla especial.", "parameters": {"type": "object", "properties": {"tecla": {"type": "string"}}, "required": ["tecla"]}}},
         {"type": "function", "function": {"name": "cerrar_ventana", "description": "Cierra la aplicacion activa simulando Alt+F4.", "parameters": {"type": "object", "properties": {}}}},
-        {"type": "function", "function": {"name": "buscar_y_reproducir_youtube", "description": "Abre YouTube, busca un video especifico y lo reproduce.", "parameters": {"type": "object", "properties": {"busqueda": {"type": "string"}}, "required": ["busqueda"]}}},
-        {"type": "function", "function": {"name": "buscar_mercadolibre", "description": "Busca un producto especifico en Mercado Libre.", "parameters": {"type": "object", "properties": {"producto": {"type": "string"}}, "required": ["producto"]}}},
-        {"type": "function", "function": {"name": "navegar_a_url", "description": "Abre cualquier sitio web o URL en el navegador.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
-        {"type": "function", "function": {"name": "hacer_clic_web", "description": "Hace clic en un texto, enlace o boton de la pagina web activa.", "parameters": {"type": "object", "properties": {"elemento": {"type": "string"}}, "required": ["elemento"]}}},
-        {"type": "function", "function": {"name": "escribir_y_buscar_web", "description": "Escribe texto en la pagina web activa y presiona Enter.", "parameters": {"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]}}}
+        {"type": "function", "function": {"name": "buscar_y_reproducir_youtube", "description": "Abre YouTube y busca/reproduce un video.", "parameters": {"type": "object", "properties": {"busqueda": {"type": "string"}}, "required": ["busqueda"]}}},
+        {"type": "function", "function": {"name": "buscar_mercadolibre", "description": "Busca un producto en Mercado Libre.", "parameters": {"type": "object", "properties": {"producto": {"type": "string"}}, "required": ["producto"]}}},
+        {"type": "function", "function": {"name": "buscar_archivo_en_disco", "description": "Busca la ruta de archivos o carpetas en el disco.", "parameters": {"type": "object", "properties": {"nombre_o_patron": {"type": "string"}, "ruta_inicio": {"type": "string"}}, "required": ["nombre_o_patron"]}}},
+        {"type": "function", "function": {"name": "explorar_carpeta", "description": "Muestra el contenido real de una carpeta dada su ruta.", "parameters": {"type": "object", "properties": {"ruta": {"type": "string"}}, "required": ["ruta"]}}},
+        {"type": "function", "function": {"name": "leer_archivo_local", "description": "Lee el contenido de un archivo.", "parameters": {"type": "object", "properties": {"ruta": {"type": "string"}}, "required": ["ruta"]}}},
+        {"type": "function", "function": {"name": "crear_o_modificar_archivo", "description": "Crea o modifica un archivo.", "parameters": {"type": "object", "properties": {"ruta": {"type": "string"}, "contenido": {"type": "string"}, "modo": {"type": "string"}}, "required": ["ruta", "contenido"]}}},
+        {"type": "function", "function": {"name": "comparar_archivos_locales", "description": "Compara dos archivos locales.", "parameters": {"type": "object", "properties": {"ruta1": {"type": "string"}, "ruta2": {"type": "string"}}, "required": ["ruta1", "ruta2"]}}}
     ]
 
 class LectorFunctionCall:
@@ -100,13 +102,17 @@ def llamar_api_sambanova(contenido_a_enviar, config_herramientas, modelo):
     if not client_sambanova: raise Exception("API Key de SambaNova no configurada")
     texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
     herramientas_json = _convertir_herramientas_a_json() if config_herramientas else None
-    respuesta = client_sambanova.chat.completions.create(
-        model=modelo,
-        messages=[{"role": "system", "content": memoria_conversacion}, {"role": "user", "content": texto_prompt}],
-        tools=herramientas_json,
-        tool_choice="auto" if herramientas_json else None,
-        stream=False
-    )
+    
+    kwargs = {
+        "model": modelo,
+        "messages": [{"role": "system", "content": memoria_conversacion}, {"role": "user", "content": texto_prompt}],
+        "stream": False
+    }
+    if herramientas_json:
+        kwargs["tools"] = herramientas_json
+        kwargs["tool_choice"] = "auto"
+        
+    respuesta = client_sambanova.chat.completions.create(**kwargs)
     return AdaptadorRespuestaOpenAI(respuesta.choices[0].message)
 
 def llamar_api_github(contenido_a_enviar, config_herramientas, modelo):
@@ -139,34 +145,6 @@ def llamar_api_openrouter(contenido_a_enviar, config_herramientas, modelo):
     respuesta = client_openrouter.chat.completions.create(model=modelo, messages=[{"role": "system", "content": memoria_conversacion}, {"role": "user", "content": texto_prompt}], tools=herramientas_json, tool_choice="auto" if herramientas_json else None, stream=False)
     return AdaptadorRespuestaOpenAI(respuesta.choices[0].message)
 
-def llamar_api_cloudflare(contenido_a_enviar, config_herramientas, modelo):
-    if not client_cloudflare: raise Exception("API Key de Cloudflare no configurada")
-    mensajes = [{"role": "system", "content": memoria_conversacion}]
-    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
-    mensajes.append({"role": "user", "content": texto_prompt})
-    respuesta = client_cloudflare.chat.completions.create(model=modelo, messages=mensajes, stream=False)
-    return AdaptadorRespuestaOpenAI(respuesta.choices[0].message)
-
-def llamar_api_cohere(contenido_a_enviar, config_herramientas, modelo):
-    if not client_cohere: raise Exception("API Key de Cohere no configurada")
-    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
-    respuesta = client_cohere.chat(model=modelo, messages=[{"role": "system", "content": memoria_conversacion}, {"role": "user", "content": texto_prompt}])
-    class AdaptadorRespuestaCohere:
-        def __init__(self, texto):
-            self.text = texto
-            self.function_calls = None
-    return AdaptadorRespuestaCohere(respuesta.message.content[0].text)
-
-def llamar_api_huggingface(contenido_a_enviar, config_herramientas, modelo):
-    if not client_hf: raise Exception("API Key de Hugging Face no configurada")
-    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
-    respuesta = client_hf.chat_completion(model=modelo, messages=[{"role": "system", "content": memoria_conversacion}, {"role": "user", "content": texto_prompt}], max_tokens=800)
-    class AdaptadorRespuestaHF:
-        def __init__(self, texto):
-            self.text = texto
-            self.function_calls = None
-    return AdaptadorRespuestaHF(respuesta.choices[0].message.content)
-
 def analizar_complejidad(texto_prompt):
     palabras_clave_complejas = ["analiza", "profundidad", "informe", "código", "programa", "resume", "compara", "explica"]
     texto_min = str(texto_prompt).lower()
@@ -189,43 +167,49 @@ def procesar_respuesta(comando):
             imagen = Image.open(ruta_imagen)
             contenido_a_enviar = [memoria_conversacion, imagen]
             
-    if requiere_vision:
-        configuracion_herramientas = None
-    else:
-        configuracion_herramientas = types.GenerateContentConfig(
-            tools=[
-                abrir_aplicacion, escribir_texto, presionar_tecla, cerrar_ventana,
-                buscar_y_reproducir_youtube, buscar_mercadolibre,
-                navegar_a_url, hacer_clic_web, escribir_y_buscar_web
-            ]
-        )
+    configuracion_herramientas = None if requiere_vision else types.GenerateContentConfig(
+        tools=[
+            abrir_aplicacion, escribir_texto, presionar_tecla, cerrar_ventana,
+            buscar_y_reproducir_youtube, buscar_mercadolibre,
+            buscar_archivo_en_disco, explorar_carpeta, leer_archivo_local,
+            crear_o_modificar_archivo, comparar_archivos_locales
+        ]
+    )
+
+    # Bucle encadenado de hasta 3 ejecuciones automáticas de herramientas
+    for _ in range(3):
+        respuesta = generar_con_respaldo(contenido_a_enviar, configuracion_herramientas)
         
-    respuesta = generar_con_respaldo(contenido_a_enviar, configuracion_herramientas)
-    
-    if getattr(respuesta, 'function_calls', None):
+        if not getattr(respuesta, 'function_calls', None):
+            break
+            
         resultados_multiples = [] 
         for function_call in respuesta.function_calls:
             resultado_accion = ""
-            if function_call.name == "abrir_aplicacion": resultado_accion = abrir_aplicacion(function_call.args["aplicacion"])
-            elif function_call.name == "escribir_texto": resultado_accion = escribir_texto(function_call.args["texto"])
-            elif function_call.name == "presionar_tecla": resultado_accion = presionar_tecla(function_call.args["tecla"])
-            elif function_call.name == "cerrar_ventana": resultado_accion = cerrar_ventana()
-            elif function_call.name == "buscar_y_reproducir_youtube": resultado_accion = buscar_y_reproducir_youtube(function_call.args["busqueda"])
-            elif function_call.name == "buscar_mercadolibre": resultado_accion = buscar_mercadolibre(function_call.args["producto"])
-            elif function_call.name == "navegar_a_url": resultado_accion = navegar_a_url(function_call.args["url"])
-            elif function_call.name == "hacer_clic_web": resultado_accion = hacer_clic_web(function_call.args["elemento"])
-            elif function_call.name == "escribir_y_buscar_web": resultado_accion = escribir_y_buscar_web(function_call.args["texto"])
+            fn_name = function_call.name
+            args = function_call.args
+            
+            if fn_name == "abrir_aplicacion": resultado_accion = abrir_aplicacion(args.get("aplicacion", ""))
+            elif fn_name == "escribir_texto": resultado_accion = escribir_texto(args.get("texto", ""))
+            elif fn_name == "presionar_tecla": resultado_accion = presionar_tecla(args.get("tecla", ""))
+            elif fn_name == "cerrar_ventana": resultado_accion = cerrar_ventana()
+            elif fn_name == "buscar_y_reproducir_youtube": resultado_accion = buscar_y_reproducir_youtube(args.get("busqueda", ""))
+            elif fn_name == "buscar_mercadolibre": resultado_accion = buscar_mercadolibre(args.get("producto", ""))
+            elif fn_name == "buscar_archivo_en_disco": resultado_accion = buscar_archivo_en_disco(**args)
+            elif fn_name == "explorar_carpeta": resultado_accion = explorar_carpeta(**args)
+            elif fn_name == "leer_archivo_local": resultado_accion = leer_archivo_local(**args)
+            elif fn_name == "crear_o_modificar_archivo": resultado_accion = crear_o_modificar_archivo(**args)
+            elif fn_name == "comparar_archivos_locales": resultado_accion = comparar_archivos_locales(**args)
+            
             resultados_multiples.append(resultado_accion)
             
         resumen_total = " ".join(resultados_multiples)
-        respuesta_final = generar_con_respaldo([f"{memoria_conversacion}\n[Sistema: {resumen_total}]\nResponde confirmando las acciones brevemente."], None)
-        texto_respuesta = respuesta_final.text
-        memoria_conversacion += f"{texto_respuesta}\n\n"
-        return texto_respuesta
-                
-    texto_final = respuesta.text
+        contenido_a_enviar = [f"{memoria_conversacion}\n[Sistema: {resumen_total}]\nInstrucción: Si el resultado anterior devolvió la ruta de una carpeta que el usuario quiere revisar, ejecuta la herramienta 'explorar_carpeta'. De lo contrario, resume brevemente lo que encontraste en español sin inventar datos."]
+
+    texto_final = respuesta.text if hasattr(respuesta, 'text') else ""
     if "user safety: safe" in texto_final.lower():
         texto_final = "Lo siento, mi red neuronal bloqueó la respuesta por seguridad."
+    
     memoria_conversacion += f"{texto_final}\n\n"
     return texto_final
 
@@ -239,23 +223,13 @@ def generar_con_respaldo(contenido_a_enviar, config_herramientas):
     modelo_github = "gpt-4o" if nivel_complejidad == "COMPLEJO" else "gpt-4o-mini"
     modelo_openrouter = "google/gemma-4-31b-it:free" if nivel_complejidad == "COMPLEJO" else "openrouter/free"
     modelo_gemini = "gemini-3.6-flash"
-    modelo_cloudflare = "@cf/meta/llama-3.1-8b-instruct-fp8"
-    modelo_cohere = "command-r-plus-08-2024" if nivel_complejidad == "COMPLEJO" else "command-r-08-2024"
-    modelo_hf = "mistralai/Mixtral-8x7B-Instruct-v0.1" if nivel_complejidad == "COMPLEJO" else "mistralai/Mistral-7B-Instruct-v0.3"
 
     apis_a_probar = [
         {"nombre": f"SambaNova ({modelo_sambanova})", "funcion": lambda cont, conf: llamar_api_sambanova(cont, conf, modelo_sambanova)},
         {"nombre": f"GitHub Models ({modelo_github})", "funcion": lambda cont, conf: llamar_api_github(cont, conf, modelo_github)},
         {"nombre": f"OpenRouter ({modelo_openrouter})", "funcion": lambda cont, conf: llamar_api_openrouter(cont, conf, modelo_openrouter)},
-        {"nombre": f"Gemini ({modelo_gemini})", "funcion": lambda cont, conf: llamar_api_gemini(cont, conf, modelo_gemini)},
-        {"nombre": f"Cloudflare ({modelo_cloudflare})", "funcion": lambda cont, conf: llamar_api_cloudflare(cont, conf, modelo_cloudflare)},
-        {"nombre": f"Cohere ({modelo_cohere})", "funcion": lambda cont, conf: llamar_api_cohere(cont, conf, modelo_cohere)},
-        {"nombre": f"Hugging Face ({modelo_hf})", "funcion": lambda cont, conf: llamar_api_huggingface(cont, conf, modelo_hf)}
+        {"nombre": f"Gemini ({modelo_gemini})", "funcion": lambda cont, conf: llamar_api_gemini(cont, conf, modelo_gemini)}
     ]
-    
-    # REGLA CLAVE: Si la orden requiere ejecucion de herramientas, descartamos motores ciegos a herramientas
-    if config_herramientas:
-        apis_a_probar = [api for api in apis_a_probar if "Cloudflare" not in api['nombre'] and "Cohere" not in api['nombre']]
     
     if isinstance(contenido_a_enviar, list) and len(contenido_a_enviar) > 1:
         apis_a_probar = [api for api in apis_a_probar if "Gemini" in api['nombre'] or "GitHub" in api['nombre']]
