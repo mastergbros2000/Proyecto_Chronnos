@@ -4,8 +4,8 @@ import os
 import subprocess
 import concurrent.futures
 import psutil
+import webbrowser
 
-# Hilo dedicado para evitar bloqueos con asyncio/audio
 executor_web = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 motor_playwright = None
@@ -26,7 +26,6 @@ def _buscar_ejecutable_opera() -> str | None:
     return None
 
 def _opera_esta_abierto() -> bool:
-    """Verifica si el navegador Opera o Opera GX está en ejecución."""
     for proc in psutil.process_iter(['name']):
         try:
             if proc.info['name'] and 'opera' in proc.info['name'].lower():
@@ -35,14 +34,27 @@ def _opera_esta_abierto() -> bool:
             pass
     return False
 
+def _contexto_sigue_activo() -> bool:
+    """Verifica de forma segura si el contexto de Playwright está conectado y abierto."""
+    global contexto_actual
+    if contexto_actual is None:
+        return False
+    try:
+        # En launch_persistent_context, contexto_actual.browser es None.
+        # Validamos comprobando si la lista de páginas es accesible.
+        _ = contexto_actual.pages
+        return True
+    except Exception:
+        return False
+
 def _obtener_pagina_navegador(es_incognito: bool = False):
     global motor_playwright, contexto_actual, pagina_actual
-    
     ruta_opera = _buscar_ejecutable_opera()
     
-    if contexto_actual is None or not contexto_actual.browser.is_connected():
-        motor_playwright = sync_playwright().start()
-        
+    if not _contexto_sigue_activo():
+        if motor_playwright is None:
+            motor_playwright = sync_playwright().start()
+            
         if es_incognito:
             print("\n[Agente Web: Abriendo ventana de Incógnito...]")
             browser = motor_playwright.chromium.launch(
@@ -53,7 +65,7 @@ def _obtener_pagina_navegador(es_incognito: bool = False):
             contexto_actual = browser.new_context()
             pagina_actual = contexto_actual.new_page()
         else:
-            print("\n[Agente Web: Abriendo ventana normal con perfil guardado...]")
+            print("\n[Agente Web: Abriendo ventana de automatización con perfil...]")
             perfil_dir = os.path.join(os.path.expanduser("~"), ".chronnos_opera_profile")
             contexto_actual = motor_playwright.chromium.launch_persistent_context(
                 user_data_dir=perfil_dir,
@@ -64,94 +76,38 @@ def _obtener_pagina_navegador(es_incognito: bool = False):
             
     return pagina_actual
 
-# =========================================================================
-# FLUJOS DE TRABAJO ESPECIALIZADOS
-# =========================================================================
-
-def _tarea_reproducir_youtube(busqueda: str, comando_original: str = "") -> str:
+def cerrar_navegador():
+    """Libera el motor Playwright y cierra las ventanas abiertas al apagar Chronnos."""
+    global motor_playwright, contexto_actual, pagina_actual
     try:
-        es_incognito = any(p in comando_original.lower() for p in ["incognito", "incógnito", "privada", "ventana privada"])
-        ruta_opera = _buscar_ejecutable_opera()
-        
-        # 1. Si Opera ya está abierto y no se pidió incógnito, abre una pestaña directa
-        if _opera_esta_abierto() and not es_incognito and contexto_actual is None:
-            print("\n[Agente Web: Opera activo detectado. Abriendo nueva pestaña...]")
-            url_busqueda = f"https://www.youtube.com/results?search_query={busqueda.replace(' ', '+')}"
-            if ruta_opera:
-                subprocess.Popen([ruta_opera, url_busqueda])
-            else:
-                import webbrowser
-                webbrowser.open(url_busqueda)
-            return f"He abierto la búsqueda de '{busqueda}' en tu navegador."
-
-        # 2. Si está cerrado o se requiere modo incógnito / automatización por Playwright
-        page = _obtener_pagina_navegador(es_incognito=es_incognito)
-        page.goto("https://www.youtube.com")
-        
-        try:
-            page.click('button[aria-label*="Aceptar"]', timeout=3000)
-        except Exception:
-            pass
-
-        page.wait_for_selector('input[name="search_query"]', timeout=15000)
-        page.fill('input[name="search_query"]', busqueda)
-        page.press('input[name="search_query"]', 'Enter')
-        
-        page.wait_for_selector('ytd-video-renderer', timeout=15000)
-        time.sleep(1)
-        
-        primer_video = page.locator('ytd-video-renderer a#video-title').first
-        primer_video.click()
-        
-        return f"He buscado y reproducido '{busqueda}' en YouTube exitosamente."
-        
-    except Exception as e:
-        print(f"[Error del Agente Web (YouTube): {e}]")
-        return "Ocurrió un error al intentar reproducir el video en YouTube."
-
-def buscar_y_reproducir_youtube(busqueda: str) -> str:
-    future = executor_web.submit(_tarea_reproducir_youtube, busqueda)
-    return future.result()
-
-def _tarea_buscar_mercadolibre(producto: str) -> str:
+        if contexto_actual:
+            contexto_actual.close()
+    except Exception:
+        pass
     try:
-        page = _obtener_pagina_navegador()
-        page.goto("https://www.mercadolibre.cl/")
-        
-        page.wait_for_selector('input.cb1-edit', timeout=15000)
-        page.fill('input.cb1-edit', producto)
-        page.press('input.cb1-edit', 'Enter')
-        
-        page.wait_for_selector('li.ui-search-layout__item', timeout=15000)
-        return f"He realizado la búsqueda de '{producto}' en Mercado Libre."
-        
-    except Exception as e:
-        print(f"[Error del Agente Web (Mercado Libre): {e}]")
-        return "Ocurrió un error al buscar en Mercado Libre."
-
-def buscar_mercadolibre(producto: str) -> str:
-    future = executor_web.submit(_tarea_buscar_mercadolibre, producto)
-    return future.result()
-
-# =========================================================================
-# HERRAMIENTAS WEB UNIVERSALES
-# =========================================================================
+        if motor_playwright:
+            motor_playwright.stop()
+    except Exception:
+        pass
+    contexto_actual = None
+    pagina_actual = None
+    motor_playwright = None
 
 def _tarea_navegar_a_url(url: str) -> str:
     try:
-        page = _obtener_pagina_navegador()
         if not url.startswith("http://") and not url.startswith("https://"):
             url = "https://" + url
+
+        page = _obtener_pagina_navegador(es_incognito=False)
         page.goto(url, timeout=20000)
         titulo = page.title()
-        return f"He navegado con éxito a '{url}'. Título: '{titulo}'."
+        return f"He navegado a '{url}'. Título: '{titulo}'."
     except Exception as e:
         print(f"[Error del Agente Web (Navegar): {e}]")
         return f"Ocurrió un error al intentar navegar a '{url}'."
 
 def navegar_a_url(url: str) -> str:
-    future = executor_web.submit(_tarea_navegar_a_url, url)
-    return future.result()
+    return executor_web.submit(_tarea_navegar_a_url, url).result()
 
 def _tarea_hacer_clic_web(elemento: str) -> str:
     try:
@@ -166,8 +122,7 @@ def _tarea_hacer_clic_web(elemento: str) -> str:
         return f"No pude hacer clic en '{elemento}'."
 
 def hacer_clic_web(elemento: str) -> str:
-    future = executor_web.submit(_tarea_hacer_clic_web, elemento)
-    return future.result()
+    return executor_web.submit(_tarea_hacer_clic_web, elemento).result()
 
 def _tarea_escribir_y_buscar_web(texto: str) -> str:
     try:
@@ -180,5 +135,43 @@ def _tarea_escribir_y_buscar_web(texto: str) -> str:
         return "Ocurrió un error al escribir en la página."
 
 def escribir_y_buscar_web(texto: str) -> str:
-    future = executor_web.submit(_tarea_escribir_y_buscar_web, texto)
-    return future.result()
+    return executor_web.submit(_tarea_escribir_y_buscar_web, texto).result()
+
+def _tarea_reproducir_youtube(busqueda: str) -> str:
+    try:
+        page = _obtener_pagina_navegador(es_incognito=False)
+        url_busqueda = f"https://www.youtube.com/results?search_query={busqueda.replace(' ', '+')}"
+        page.goto(url_busqueda, timeout=20000)
+        
+        try:
+            page.click('button[aria-label*="Aceptar"]', timeout=3000)
+        except Exception:
+            pass
+
+        page.wait_for_selector('ytd-video-renderer a#video-title', timeout=15000)
+        time.sleep(1)
+        primer_video = page.locator('ytd-video-renderer a#video-title').first
+        primer_video.click()
+        return f"He buscado y reproducido el video sobre '{busqueda}' en YouTube exitosamente."
+    except Exception as e:
+        print(f"[Error del Agente Web (YouTube): {e}]")
+        return f"Ocurrió un error al reproducir YouTube: {e}"
+
+def buscar_y_reproducir_youtube(busqueda: str) -> str:
+    return executor_web.submit(_tarea_reproducir_youtube, busqueda).result()
+
+def _tarea_buscar_mercadolibre(producto: str) -> str:
+    try:
+        page = _obtener_pagina_navegador()
+        page.goto("https://www.mercadolibre.cl/")
+        page.wait_for_selector('input.cb1-edit', timeout=15000)
+        page.fill('input.cb1-edit', producto)
+        page.press('input.cb1-edit', 'Enter')
+        page.wait_for_selector('li.ui-search-layout__item', timeout=15000)
+        return f"He realizado la búsqueda de '{producto}' en Mercado Libre."
+    except Exception as e:
+        print(f"[Error del Agente Web (Mercado Libre): {e}]")
+        return "Ocurrió un error al buscar en Mercado Libre."
+
+def buscar_mercadolibre(producto: str) -> str:
+    return executor_web.submit(_tarea_buscar_mercadolibre, producto).result()
