@@ -6,6 +6,7 @@ import json
 import base64
 import io
 import re
+import queue
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
@@ -225,6 +226,95 @@ def analizar_complejidad(texto_prompt):
     texto_min = str(texto_prompt).lower()
     return "COMPLEJO" if any(p in texto_min for p in palabras_clave_complejas) else "RAPIDO"
 
+_DELIMITADORES_ORACION = re.compile(r'(?<=[.?!\n])\s*')
+
+def generar_stream_oraciones(contenido_a_enviar, config_herramientas):
+    """
+    Generador de oraciones completas obtenidas por streaming desde Gemini.
+    Acumula fragmentos del stream hasta detectar un delimitador de oración
+    (.  ?  !  \\n) y emite cada oración limpia al instante.
+    Ante cualquier fallo de la API, cede al modo no-streaming de respaldo
+    y emite el texto completo partido en oraciones.
+
+    Yields:
+        str: Una oración completa lista para ser sintetizada por TTS.
+    """
+    global penalizaciones_api
+    texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
+
+    # Solo admite streaming en rutas sin visión multimodal y sin Function Calling
+    es_multimodal = isinstance(contenido_a_enviar, list) and len(contenido_a_enviar) > 1
+    requiere_tools = config_herramientas is not None
+
+    if es_multimodal or requiere_tools:
+        # En rutas con herramientas o visión no hay streaming; se usa el motor completo
+        respuesta = generar_con_respaldo(contenido_a_enviar, config_herramientas)
+        texto_completo = getattr(respuesta, 'text', '') or ""
+        for oracion in _partir_en_oraciones(texto_completo):
+            yield oracion
+        return
+
+    # Intentar streaming directo con Gemini (primer proveedor disponible)
+    modelo_gemini = "gemini-3.6-flash"
+    nombre_gemini = f"Gemini ({modelo_gemini})"
+    penalizado = nombre_gemini in penalizaciones_api and (
+        time.time() - penalizaciones_api[nombre_gemini] < TIEMPO_CASTIGO
+    )
+
+    if client_gemini and not penalizado:
+        print(f"[Coordinador Stream: Iniciando stream con {nombre_gemini}...]")
+        acumulador = ""
+        try:
+            for chunk in client_gemini.models.generate_content_stream(
+                model=modelo_gemini,
+                contents=contenido_a_enviar,
+                config=config_herramientas or types.GenerateContentConfig()
+            ):
+                if interrupcion_stream.is_set():
+                    break
+                fragmento = ""
+                try:
+                    fragmento = chunk.text or ""
+                except Exception:
+                    pass
+                acumulador += fragmento
+                # Emitir oración al detectar delimitador
+                while True:
+                    match = re.search(r'[.?!\n]', acumulador)
+                    if not match:
+                        break
+                    idx = match.end()
+                    oracion = acumulador[:idx].strip()
+                    acumulador = acumulador[idx:]
+                    if oracion:
+                        yield oracion
+            # Emitir lo que quede en el acumulador al terminar el stream
+            if acumulador.strip():
+                yield acumulador.strip()
+            return
+        except Exception as e:
+            print(f"[Coordinador Stream: Fallo en streaming de {nombre_gemini} - {e}. Cediendo a respaldo clásico.]")
+            penalizaciones_api[nombre_gemini] = time.time()
+
+    # Respaldo no-streaming: usa generar_con_respaldo y parte el texto en oraciones
+    respuesta = generar_con_respaldo(contenido_a_enviar, config_herramientas)
+    texto_completo = getattr(respuesta, 'text', '') or ""
+    for oracion in _partir_en_oraciones(texto_completo):
+        yield oracion
+
+def _partir_en_oraciones(texto: str):
+    """Divide un bloque de texto en oraciones usando los mismos delimitadores del stream."""
+    if not texto:
+        return
+    partes = re.split(r'(?<=[.?!\n])\s*', texto)
+    for parte in partes:
+        parte = parte.strip()
+        if parte:
+            yield parte
+
+# Bandera global para interrumpir el generador de stream desde audio (Barge-In)
+interrupcion_stream = threading.Event()
+
 def procesar_respuesta(comando):
     global historial_conversacion
     comando_limpio = comando.lower()
@@ -325,15 +415,26 @@ def procesar_respuesta(comando):
         
         historial_conversacion.append({"role": "user", "content": comando})
         historial_conversacion.append({"role": "assistant", "content": texto_respuesta})
+        # Ruta con herramientas: retorna texto plano (la confirmación ya es corta)
         return texto_respuesta
                 
-    texto_final = getattr(respuesta, 'text', '') or "No pude procesar la respuesta."
-    if "user safety: safe" in texto_final.lower():
-        texto_final = "La respuesta fue filtrada por las políticas de seguridad del modelo."
-        
-    historial_conversacion.append({"role": "user", "content": comando})
-    historial_conversacion.append({"role": "assistant", "content": texto_final})
-    return texto_final
+    # --- Ruta conversacional (sin Function Calling): emite oraciones del texto ya obtenido ---
+    # El texto ya está en `respuesta` de la primera llamada; lo partimos en oraciones para
+    # que hablar_stream pueda sintetizar cada una en cuanto esté lista (prefetch TTS).
+    texto_conversacional = getattr(respuesta, 'text', '') or "No pude generar una respuesta."
+    if "user safety: safe" in texto_conversacional.lower():
+        texto_conversacional = "La respuesta fue filtrada por las políticas de seguridad del modelo."
+
+    def _generador_con_historial():
+        texto_acumulado = []
+        for oracion in _partir_en_oraciones(texto_conversacional):
+            texto_acumulado.append(oracion)
+            yield oracion
+        texto_completo = " ".join(texto_acumulado)
+        historial_conversacion.append({"role": "user", "content": comando})
+        historial_conversacion.append({"role": "assistant", "content": texto_completo})
+
+    return _generador_con_historial()
 
 def generar_con_respaldo(contenido_a_enviar, config_herramientas):
     global penalizaciones_api

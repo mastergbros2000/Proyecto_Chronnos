@@ -3,8 +3,8 @@ import pygame
 import time
 import re
 
-from audio import hablar, escuchar
-from cerebro import procesar_respuesta
+from audio import hablar, hablar_stream, escuchar
+from cerebro import procesar_respuesta, generar_stream_oraciones, interrupcion_stream
 from agenda_y_tiempo import registrar_callback_voz, cargar_y_reprogramar_recordatorios_existentes
 from navegador_web import cerrar_navegador
 
@@ -55,8 +55,15 @@ try:
                         break 
                         
                     print("[Chronnos está pensando...]")
-                    respuesta_texto = procesar_respuesta(comando)
-                    hablar(respuesta_texto)
+                    interrupcion_stream.clear()
+                    respuesta = procesar_respuesta(comando)
+                    # Si procesar_respuesta devuelve texto plano (ruta de herramientas/visión),
+                    # se habla directamente. Si devuelve un generador (ruta conversacional),
+                    # se usa hablar_stream para latencia mínima oración a oración.
+                    if isinstance(respuesta, str):
+                        hablar(respuesta)
+                    else:
+                        hablar_stream(respuesta)
                     
                 print("\n[Volviendo al modo reposo... Esperando a 'Chronnos']")
 

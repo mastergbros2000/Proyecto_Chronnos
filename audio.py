@@ -8,6 +8,8 @@ import asyncio
 import edge_tts
 import re
 import threading
+import queue
+import time as _time
 
 pygame.mixer.init()
 
@@ -129,6 +131,97 @@ def hablar(texto: str, voz: str = "es-CL-LorenzoNeural"):
                 buffer_audio.close()
             except Exception:
                 pass
+
+def hablar_stream(iterador_oraciones, voz: str = "es-CL-LorenzoNeural"):
+    """
+    Reproduce oraciones en streaming con latencia mínima.
+    Consume un iterador/generador de cadenas de texto (oraciones completas),
+    sintetiza cada una con edge-tts y la reproduce en cuanto esté lista.
+    El audio de la oración N+1 se prepara en un hilo de prefetch mientras
+    se reproduce la oración N, eliminando el tiempo muerto entre frases.
+    Soporta interrupción por Barge-In igual que hablar().
+    """
+    global reproduciendo_audio, interrupcion_solicitada
+    interrupcion_solicitada = False
+
+    cola_buffers: queue.Queue = queue.Queue(maxsize=2)  # prefetch de máximo 2 oraciones adelante
+    SENTINEL = object()
+
+    def _sintetizar_worker():
+        """Hilo productor: convierte cada oración a bytes MP3 y los encola."""
+        for oracion in iterador_oraciones:
+            if not oracion or not oracion.strip():
+                continue
+            if interrupcion_solicitada:
+                break
+            try:
+                buf = asyncio.run(_generar_bytes_voz(oracion, voz))
+                cola_buffers.put((oracion, buf))
+            except Exception as e:
+                print(f"[Hablar Stream: Error al sintetizar '{oracion[:40]}': {e}]")
+        cola_buffers.put(SENTINEL)
+
+    hilo_sintetizador = threading.Thread(target=_sintetizar_worker, daemon=True)
+    hilo_sintetizador.start()
+
+    stop_event = threading.Event()
+    reconocedor_barge_in = sr.Recognizer()
+    hilo_barge_in = threading.Thread(
+        target=_monitor_barge_in,
+        args=(reconocedor_barge_in, stop_event),
+        daemon=True
+    )
+    hilo_barge_in.start()
+
+    reproduciendo_audio = True
+    buffer_actual = None
+
+    try:
+        while True:
+            if interrupcion_solicitada:
+                pygame.mixer.music.stop()
+                break
+
+            item = cola_buffers.get()
+            if item is SENTINEL:
+                break
+
+            oracion_texto, buffer_actual = item
+            print(f"Chronnos: {oracion_texto}")
+
+            try:
+                pygame.mixer.music.load(buffer_actual)
+                pygame.mixer.music.play()
+
+                while pygame.mixer.music.get_busy():
+                    if interrupcion_solicitada:
+                        pygame.mixer.music.stop()
+                        break
+                    pygame.time.wait(25)
+
+            except Exception as e:
+                print(f"[Hablar Stream: Error al reproducir: {e}]")
+            finally:
+                try:
+                    pygame.mixer.music.unload()
+                except Exception:
+                    pass
+                try:
+                    buffer_actual.close()
+                except Exception:
+                    pass
+                buffer_actual = None
+
+    except Exception as e:
+        print(f"[Error en hablar_stream: {e}]")
+    finally:
+        stop_event.set()
+        reproduciendo_audio = False
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
 
 def detener_habla():
     global interrupcion_solicitada
