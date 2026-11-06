@@ -32,3 +32,15 @@ Actuar como Auditor de Software y Copiloto de Desarrollo para el Proyecto Chronn
 7. **Protocolo de Verificación:**
    - Cada grupo de cambios debe ser acompañado por una instrucción clara de prueba sintética o comando de terminal para validar la estabilidad en el sistema.
 
+8. **Protocolo Permanente de Informes en PDF (`..\informes_Chronnos\`):**
+   - Todos los informes técnicos, auditorías, reportes de pruebas y análisis de rendimiento (tanto anteriores como futuros) deben generarse obligatoriamente fuera del espacio de trabajo del proyecto, centralizados en la carpeta `..\informes_Chronnos\` (ubicada en el directorio madre 'proyectos programacion').
+   - Formato exclusivo: **Todos los informes deben ser exportados en formato PDF**.
+   - Cada nuevo informe PDF deberá incluir de forma obligatoria y estructurada:
+     * Fecha y hora exacta de realización en formato `YYYY-MM-DD HH:MM:SS`.
+     * Registro detallado de pruebas y verificación de código.
+     * Errores detectados y diagnóstico de soluciones aplicadas.
+     * Métricas de usabilidad y funcionalidad del sistema.
+     * Monitoreo del entorno de ejecución y hardware.
+     * Nivel de adaptabilidad y resiliencia del sistema.
+     * Sugerencias de mejoras futuras dentro de los límites de las Fases activas (1, 2 y 3).
+

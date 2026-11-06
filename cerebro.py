@@ -18,13 +18,25 @@ import cohere
 from huggingface_hub import InferenceClient
 
 # Fase 3: Control de sistema y navegador
-from control_sistema import abrir_aplicacion, escribir_texto, presionar_tecla, cerrar_ventana
+from control_sistema import (
+    abrir_aplicacion, 
+    escribir_texto, 
+    presionar_tecla, 
+    cerrar_ventana,
+    consultar_estado_pc,
+    subir_volumen,
+    bajar_volumen,
+    silenciar_audio,
+    pausar_multimedia
+)
 from navegador_web import (
     buscar_y_reproducir_youtube, 
     buscar_mercadolibre, 
     navegar_a_url, 
     hacer_clic_web, 
-    escribir_y_buscar_web
+    escribir_y_buscar_web,
+    cerrar_pestanas_secundarias,
+    leer_pagina_actual
 )
 # Fase 3: Archivos y Agenda/Clima integrados
 from gestor_archivos import (
@@ -42,7 +54,7 @@ from agenda_y_tiempo import (
     agendar_evento,
     consultar_agenda
 )
-from vision import capturar_imagen, cargar_imagen_segura
+from vision import capturar_imagen, capturar_pantalla, cargar_imagen_segura, inspeccionar_imagen_local
 
 load_dotenv() 
 
@@ -105,7 +117,15 @@ def _convertir_herramientas_a_json():
         {"type": "function", "function": {"name": "consultar_clima", "description": "Consulta el clima actual o pronóstico.", "parameters": {"type": "object", "properties": {"dias_adelante": {"type": "integer"}}, "required": []}}},
         {"type": "function", "function": {"name": "establecer_temporizador", "description": "Establece un temporizador con alarma de voz.", "parameters": {"type": "object", "properties": {"minutos": {"type": "number"}, "motivo": {"type": "string"}}, "required": ["minutos"]}}},
         {"type": "function", "function": {"name": "agendar_evento", "description": "Agenda una cita o recordatorio.", "parameters": {"type": "object", "properties": {"titulo": {"type": "string"}, "fecha": {"type": "string"}, "hora": {"type": "string"}}, "required": ["titulo", "fecha", "hora"]}}},
-        {"type": "function", "function": {"name": "consultar_agenda", "description": "Consulta compromisos en la agenda.", "parameters": {"type": "object", "properties": {"fecha_busqueda": {"type": "string"}}, "required": []}}}
+        {"type": "function", "function": {"name": "consultar_agenda", "description": "Consulta compromisos en la agenda.", "parameters": {"type": "object", "properties": {"fecha_busqueda": {"type": "string"}}, "required": []}}},
+        {"type": "function", "function": {"name": "consultar_estado_pc", "description": "Obtiene la telemetría del sistema (CPU, RAM, batería y espacio en disco).", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "subir_volumen", "description": "Sube el volumen del audio del sistema.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "bajar_volumen", "description": "Baja el volumen del audio del sistema.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "silenciar_audio", "description": "Alterna el silencio del audio del sistema.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "pausar_multimedia", "description": "Pausa o reanuda la reproducción multimedia.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "cerrar_pestanas_secundarias", "description": "Cierra las pestañas inactivas secundarias del navegador, manteniendo la principal.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "leer_pagina_actual", "description": "Lee y extrae el texto principal del contenido de la página web activa.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "capturar_pantalla", "description": "Toma una captura de la pantalla completa del sistema para análisis visual.", "parameters": {"type": "object", "properties": {}}}}
     ]   
 
 class LectorFunctionCall:
@@ -221,40 +241,81 @@ def llamar_api_huggingface(contenido_a_enviar, config_herramientas, modelo):
             self.function_calls = None
     return AdaptadorRespuestaHF(respuesta.choices[0].message.content)
 
+# Caché volátil en memoria RAM con expiración de 15 segundos para consultas frecuentes
+cache_estado_temporal = {}
+CACHE_TTL_SEGUNDOS = 15.0
+
+def _consultar_cache_o_ejecutar(clave: str, funcion_ejecutar):
+    ahora = time.time()
+    if clave in cache_estado_temporal:
+        ts, valor = cache_estado_temporal[clave]
+        if ahora - ts < CACHE_TTL_SEGUNDOS:
+            print(f"[Caché Volátil: Recuperando '{clave}' de memoria RAM ({round(ahora - ts, 1)}s)]")
+            return valor
+    resultado = funcion_ejecutar()
+    cache_estado_temporal[clave] = (ahora, resultado)
+    return resultado
+
+def _trimming_dinamico_historial():
+    """Elimina automáticamente turnos antiguos al superar 3,500 caracteres acumulados en RAM."""
+    global historial_conversacion
+    longitud_total = sum(len(str(m.get("content", ""))) for m in historial_conversacion)
+    while longitud_total > 3500 and len(historial_conversacion) > 2:
+        historial_conversacion.pop(0)
+        if historial_conversacion:
+            historial_conversacion.pop(0)
+        longitud_total = sum(len(str(m.get("content", ""))) for m in historial_conversacion)
+        print(f"[Cerebro RAM: Trimming dinámico ejecutado (historial reducido a {longitud_total} caracteres)]")
+
 def analizar_complejidad(texto_prompt):
     palabras_clave_complejas = ["analiza", "profundidad", "informe", "código", "programa", "resume", "compara", "explica", "describe la imagen"]
     texto_min = str(texto_prompt).lower()
     return "COMPLEJO" if any(p in texto_min for p in palabras_clave_complejas) else "RAPIDO"
 
-_DELIMITADORES_ORACION = re.compile(r'(?<=[.?!\n])\s*')
+def _partir_en_oraciones(texto: str):
+    """
+    Divide un bloque de texto en oraciones para síntesis TTS de ultra-baja latencia.
+    Usa delimitadores fuertes (. ? ! \n) y comas (,) únicamente cuando se hayan acumulado >= 8 palabras.
+    """
+    if not texto:
+        return
+    partes = re.split(r'([.?!\n]|,\s*)', texto)
+    acumulado = ""
+    for i in range(0, len(partes) - 1, 2):
+        chunk = partes[i]
+        delim = partes[i + 1] if (i + 1) < len(partes) else ""
+        acumulado += chunk + delim
+        palabras = acumulado.strip().split()
+        es_fuerte = any(p in delim for p in [".", "?", "!", "\n"])
+        es_coma = "," in delim
+        if es_fuerte or (es_coma and len(palabras) >= 8):
+            segmento = acumulado.strip()
+            if segmento:
+                yield segmento
+            acumulado = ""
+    if len(partes) % 2 != 0:
+        acumulado += partes[-1]
+    if acumulado.strip():
+        yield acumulado.strip()
 
 def generar_stream_oraciones(contenido_a_enviar, config_herramientas):
     """
-    Generador de oraciones completas obtenidas por streaming desde Gemini.
-    Acumula fragmentos del stream hasta detectar un delimitador de oración
-    (.  ?  !  \\n) y emite cada oración limpia al instante.
-    Ante cualquier fallo de la API, cede al modo no-streaming de respaldo
-    y emite el texto completo partido en oraciones.
-
-    Yields:
-        str: Una oración completa lista para ser sintetizada por TTS.
+    Generador de oraciones en streaming con delimitación por comas (umbral >= 8 palabras).
+    Inicia la emisión de voz en ~200 ms sin segmentar frases breves.
     """
     global penalizaciones_api
     texto_prompt = contenido_a_enviar[0] if isinstance(contenido_a_enviar, list) else contenido_a_enviar
 
-    # Solo admite streaming en rutas sin visión multimodal y sin Function Calling
     es_multimodal = isinstance(contenido_a_enviar, list) and len(contenido_a_enviar) > 1
     requiere_tools = config_herramientas is not None
 
     if es_multimodal or requiere_tools:
-        # En rutas con herramientas o visión no hay streaming; se usa el motor completo
         respuesta = generar_con_respaldo(contenido_a_enviar, config_herramientas)
         texto_completo = getattr(respuesta, 'text', '') or ""
         for oracion in _partir_en_oraciones(texto_completo):
             yield oracion
         return
 
-    # Intentar streaming directo con Gemini (primer proveedor disponible)
     modelo_gemini = "gemini-3.6-flash"
     nombre_gemini = f"Gemini ({modelo_gemini})"
     penalizado = nombre_gemini in penalizaciones_api and (
@@ -278,17 +339,23 @@ def generar_stream_oraciones(contenido_a_enviar, config_herramientas):
                 except Exception:
                     pass
                 acumulador += fragmento
-                # Emitir oración al detectar delimitador
                 while True:
-                    match = re.search(r'[.?!\n]', acumulador)
-                    if not match:
+                    match_fuerte = re.search(r'[.?!\n]', acumulador)
+                    match_coma = re.search(r',', acumulador)
+                    if match_fuerte:
+                        idx = match_fuerte.end()
+                        oracion = acumulador[:idx].strip()
+                        acumulador = acumulador[idx:]
+                        if oracion:
+                            yield oracion
+                    elif match_coma and len(acumulador[:match_coma.end()].strip().split()) >= 8:
+                        idx = match_coma.end()
+                        oracion = acumulador[:idx].strip()
+                        acumulador = acumulador[idx:]
+                        if oracion:
+                            yield oracion
+                    else:
                         break
-                    idx = match.end()
-                    oracion = acumulador[:idx].strip()
-                    acumulador = acumulador[idx:]
-                    if oracion:
-                        yield oracion
-            # Emitir lo que quede en el acumulador al terminar el stream
             if acumulador.strip():
                 yield acumulador.strip()
             return
@@ -296,24 +363,66 @@ def generar_stream_oraciones(contenido_a_enviar, config_herramientas):
             print(f"[Coordinador Stream: Fallo en streaming de {nombre_gemini} - {e}. Cediendo a respaldo clásico.]")
             penalizaciones_api[nombre_gemini] = time.time()
 
-    # Respaldo no-streaming: usa generar_con_respaldo y parte el texto en oraciones
     respuesta = generar_con_respaldo(contenido_a_enviar, config_herramientas)
     texto_completo = getattr(respuesta, 'text', '') or ""
     for oracion in _partir_en_oraciones(texto_completo):
         yield oracion
 
-def _partir_en_oraciones(texto: str):
-    """Divide un bloque de texto en oraciones usando los mismos delimitadores del stream."""
-    if not texto:
-        return
-    partes = re.split(r'(?<=[.?!\n])\s*', texto)
-    for parte in partes:
-        parte = parte.strip()
-        if parte:
-            yield parte
-
 # Bandera global para interrumpir el generador de stream desde audio (Barge-In)
 interrupcion_stream = threading.Event()
+
+def _ejecutar_herramienta_individual(fn: str, args: dict) -> tuple[str, Image.Image | None]:
+    """Despachador centralizado para todas las herramientas físicas de la Fase 3."""
+    resultado = ""
+    imagen_extraida = None
+    
+    if fn == "abrir_aplicacion": resultado = abrir_aplicacion(args.get("aplicacion", ""))
+    elif fn == "escribir_texto": resultado = escribir_texto(args.get("texto", ""))
+    elif fn == "presionar_tecla": resultado = presionar_tecla(args.get("tecla", ""))
+    elif fn == "cerrar_ventana": resultado = cerrar_ventana()
+    elif fn == "consultar_estado_pc": resultado = consultar_estado_pc()
+    elif fn == "subir_volumen": resultado = subir_volumen()
+    elif fn == "bajar_volumen": resultado = bajar_volumen()
+    elif fn == "silenciar_audio": resultado = silenciar_audio()
+    elif fn == "pausar_multimedia": resultado = pausar_multimedia()
+    elif fn == "buscar_y_reproducir_youtube": resultado = buscar_y_reproducir_youtube(args.get("busqueda", ""))
+    elif fn == "buscar_mercadolibre": resultado = buscar_mercadolibre(args.get("producto", ""))
+    elif fn == "navegar_a_url": resultado = navegar_a_url(args.get("url", ""))
+    elif fn == "hacer_clic_web": resultado = hacer_clic_web(args.get("elemento", ""))
+    elif fn == "escribir_y_buscar_web": resultado = escribir_y_buscar_web(args.get("texto", ""))
+    elif fn == "cerrar_pestanas_secundarias": resultado = cerrar_pestanas_secundarias()
+    elif fn == "leer_pagina_actual": resultado = leer_pagina_actual()
+    elif fn == "buscar_archivo_en_disco": resultado = buscar_archivo_en_disco(args.get("nombre_o_patron", ""), args.get("ruta_inicio"))
+    elif fn == "explorar_carpeta": resultado = explorar_carpeta(args.get("ruta", ""))
+    elif fn == "explorar_archivo_comprimido": resultado = explorar_archivo_comprimido(args.get("ruta", ""))
+    elif fn == "leer_archivo_local":
+        resultado = leer_archivo_local(args.get("ruta", ""))
+        if "[IMAGEN_LOCAL:" in resultado:
+            match_img = re.search(r'\[IMAGEN_LOCAL:(.+?)\]', resultado)
+            if match_img:
+                ruta_extraida = match_img.group(1).strip()
+                imagen_extraida = cargar_imagen_segura(ruta_extraida)
+    elif fn == "crear_o_modificar_archivo": resultado = crear_o_modificar_archivo(args.get("ruta", ""), args.get("contenido", ""), args.get("modo", "sobreescribir"))
+    elif fn == "comparar_archivos_locales": resultado = comparar_archivos_locales(args.get("ruta1", ""), args.get("ruta2", ""))
+    elif fn == "obtener_fecha_y_hora_actual":
+        resultado = _consultar_cache_o_ejecutar("fecha_hora", obtener_fecha_y_hora_actual)
+    elif fn == "consultar_clima":
+        dias = args.get("dias_adelante", 0)
+        resultado = _consultar_cache_o_ejecutar(f"clima_{dias}", lambda: consultar_clima(dias))
+    elif fn == "establecer_temporizador": resultado = establecer_temporizador(args.get("minutos", 1), args.get("motivo", "Temporizador"))
+    elif fn == "agendar_evento": resultado = agendar_evento(args.get("titulo", ""), args.get("fecha", "hoy"), args.get("hora", ""))
+    elif fn == "consultar_agenda": resultado = consultar_agenda(args.get("fecha_busqueda", "hoy"))
+    elif fn == "capturar_pantalla":
+        ruta_p = capturar_pantalla()
+        if ruta_p and os.path.exists(ruta_p):
+            imagen_extraida = cargar_imagen_segura(ruta_p)
+            resultado = "Captura de pantalla realizada exitosamente."
+        else:
+            resultado = "No fue posible realizar la captura de pantalla."
+    else:
+        resultado = f"Acción '{fn}' ejecutada."
+        
+    return resultado, imagen_extraida
 
 def procesar_respuesta(comando):
     global historial_conversacion
@@ -328,12 +437,22 @@ def procesar_respuesta(comando):
             imagen_directa = cargar_imagen_segura(posible_ruta)
             
     palabras_vision = ["mira", "observa", "qué es esto", "que es esto", "qué tengo en la mano", "ves esto", "analiza esta imagen", "cámara", "camara", "foto", "fotografía"]
+    palabras_pantalla = ["pantalla", "screen", "mi monitor", "qué se ve", "que se ve", "error sale", "este código", "este programa"]
+    
     requiere_vision = imagen_directa is not None or any(palabra in comando_limpio for palabra in palabras_vision)
+    requiere_pantalla = any(palabra in comando_limpio for palabra in palabras_pantalla)
     
     contenido_a_enviar = [comando]
     
     if imagen_directa:
         contenido_a_enviar = [comando, imagen_directa]
+    elif requiere_pantalla:
+        ruta_pantalla = capturar_pantalla()
+        if ruta_pantalla and os.path.exists(ruta_pantalla):
+            img_scr = cargar_imagen_segura(ruta_pantalla)
+            if img_scr:
+                contenido_a_enviar = [comando, img_scr]
+                requiere_vision = True
     elif requiere_vision:
         ruta_camara = capturar_imagen()
         if ruta_camara and os.path.exists(ruta_camara):
@@ -347,80 +466,65 @@ def procesar_respuesta(comando):
         configuracion_herramientas = types.GenerateContentConfig(
             tools=[
                 abrir_aplicacion, escribir_texto, presionar_tecla, cerrar_ventana,
+                consultar_estado_pc, subir_volumen, bajar_volumen, silenciar_audio, pausar_multimedia,
                 buscar_y_reproducir_youtube, buscar_mercadolibre,
                 navegar_a_url, hacer_clic_web, escribir_y_buscar_web,
+                cerrar_pestanas_secundarias, leer_pagina_actual,
                 buscar_archivo_en_disco, explorar_carpeta, explorar_archivo_comprimido,
                 leer_archivo_local, crear_o_modificar_archivo, comparar_archivos_locales,
                 obtener_fecha_y_hora_actual, consultar_clima, establecer_temporizador,
-                agendar_evento, consultar_agenda
+                agendar_evento, consultar_agenda, capturar_pantalla
             ]
         )
         
     respuesta = generar_con_respaldo(contenido_a_enviar, configuracion_herramientas)
     
+    # 2. Arnés ReAct Multi-Paso Iterativo (Pilar 5): hasta 5 iteraciones de herramientas
     if getattr(respuesta, 'function_calls', None):
-        resultados_multiples = []
-        imagen_extraida_de_archivo = None
+        MAX_ITERACIONES_REACT = 5
+        iteracion = 0
+        pasos_resumen = []
+        imagen_contexto = None
+        respuesta_actual = respuesta
         
-        for function_call in respuesta.function_calls:
-            resultado_accion = ""
-            args = function_call.args if isinstance(function_call.args, dict) else {}
-            fn = function_call.name
+        while iteracion < MAX_ITERACIONES_REACT and getattr(respuesta_actual, 'function_calls', None):
+            iteracion += 1
+            print(f"\n[Arnés ReAct: Iteración {iteracion}/{MAX_ITERACIONES_REACT}]")
+            for fc in respuesta_actual.function_calls:
+                args = fc.args if isinstance(fc.args, dict) else {}
+                res_accion, img = _ejecutar_herramienta_individual(fc.name, args)
+                pasos_resumen.append(res_accion)
+                if img:
+                    imagen_contexto = img
+                    
+            resumen_acciones = " ".join(pasos_resumen)
             
-            if fn == "abrir_aplicacion": resultado_accion = abrir_aplicacion(args.get("aplicacion", ""))
-            elif fn == "escribir_texto": resultado_accion = escribir_texto(args.get("texto", ""))
-            elif fn == "presionar_tecla": resultado_accion = presionar_tecla(args.get("tecla", ""))
-            elif fn == "cerrar_ventana": resultado_accion = cerrar_ventana()
-            elif fn == "buscar_y_reproducir_youtube": resultado_accion = buscar_y_reproducir_youtube(args.get("busqueda", ""))
-            elif fn == "buscar_mercadolibre": resultado_accion = buscar_mercadolibre(args.get("producto", ""))
-            elif fn == "navegar_a_url": resultado_accion = navegar_a_url(args.get("url", ""))
-            elif fn == "hacer_clic_web": resultado_accion = hacer_clic_web(args.get("elemento", ""))
-            elif fn == "escribir_y_buscar_web": resultado_accion = escribir_y_buscar_web(args.get("texto", ""))
-            elif fn == "buscar_archivo_en_disco": resultado_accion = buscar_archivo_en_disco(args.get("nombre_o_patron", ""), args.get("ruta_inicio"))
-            elif fn == "explorar_carpeta": resultado_accion = explorar_carpeta(args.get("ruta", ""))
-            elif fn == "explorar_archivo_comprimido": resultado_accion = explorar_archivo_comprimido(args.get("ruta", ""))
-            elif fn == "leer_archivo_local":
-                resultado_accion = leer_archivo_local(args.get("ruta", ""))
-                # Si la lectura corresponde a una imagen local, se activa el pipeline multimodal
-                if "[IMAGEN_LOCAL:" in resultado_accion:
-                    match_img = re.search(r'\[IMAGEN_LOCAL:(.+?)\]', resultado_accion)
-                    if match_img:
-                        ruta_extraida = match_img.group(1).strip()
-                        imagen_extraida_de_archivo = cargar_imagen_segura(ruta_extraida)
-            elif fn == "crear_o_modificar_archivo": resultado_accion = crear_o_modificar_archivo(args.get("ruta", ""), args.get("contenido", ""), args.get("modo", "sobreescribir"))
-            elif fn == "comparar_archivos_locales": resultado_accion = comparar_archivos_locales(args.get("ruta1", ""), args.get("ruta2", ""))
-            elif fn == "obtener_fecha_y_hora_actual": resultado_accion = obtener_fecha_y_hora_actual()
-            elif fn == "consultar_clima": resultado_accion = consultar_clima(args.get("dias_adelante", 0))
-            elif fn == "establecer_temporizador": resultado_accion = establecer_temporizador(args.get("minutos", 1), args.get("motivo", "Temporizador"))
-            elif fn == "agendar_evento": resultado_accion = agendar_evento(args.get("titulo", ""), args.get("fecha", "hoy"), args.get("hora", ""))
-            elif fn == "consultar_agenda": resultado_accion = consultar_agenda(args.get("fecha_busqueda", "hoy"))
-            resultados_multiples.append(resultado_accion)
+            if imagen_contexto:
+                prompt_react = (
+                    f"Instrucción del usuario: {comando}\n"
+                    f"[Resultados de herramientas ejecutadas: {resumen_acciones}]\n"
+                    "Analiza la imagen adjunta y responde detalladamente a la solicitud del usuario."
+                )
+                contenido_siguiente = [prompt_react, imagen_contexto]
+            else:
+                prompt_react = (
+                    f"Instrucción del usuario: {comando}\n"
+                    f"[Resultados de herramientas ejecutadas: {resumen_acciones}]\n"
+                    "Si la tarea ya está concluida, responde brevemente confirmando la acción realizada. "
+                    "Si requieres otra acción física adicional, invócala mediante Function Calling."
+                )
+                contenido_siguiente = [prompt_react]
+                
+            config_siguiente = configuracion_herramientas if iteracion < (MAX_ITERACIONES_REACT - 1) else None
+            respuesta_actual = generar_con_respaldo(contenido_siguiente, config_siguiente)
             
-        resumen_total = " ".join(resultados_multiples)
-        
-        # Si se detectó una imagen física en el disco, se delega su interpretación a los modelos visuales
-        if imagen_extraida_de_archivo:
-            prompt_confirmacion = (
-                f"Instrucción del usuario: {comando}\n"
-                f"[Resultado de inspección de archivo: {resumen_total}]\n"
-                "Describe con claridad y detalle lo que observas en la imagen adjunta, indicando elementos visuales, textos o contexto principal."
-            )
-            contenido_confirmacion = [prompt_confirmacion, imagen_extraida_de_archivo]
-        else:
-            prompt_confirmacion = f"Instrucción del usuario: {comando}\n[Resultado de la acción: {resumen_total}]\nConfirma brevemente al usuario la acción realizada."
-            contenido_confirmacion = [prompt_confirmacion]
-            
-        respuesta_final = generar_con_respaldo(contenido_confirmacion, None)
-        texto_respuesta = getattr(respuesta_final, 'text', '') or resumen_total
-        
+        texto_respuesta = getattr(respuesta_actual, 'text', '') or resumen_acciones
         historial_conversacion.append({"role": "user", "content": comando})
         historial_conversacion.append({"role": "assistant", "content": texto_respuesta})
-        # Ruta con herramientas: retorna texto plano (la confirmación ya es corta)
+        _trimming_dinamico_historial()
         return texto_respuesta
                 
-    # --- Ruta conversacional (sin Function Calling): emite oraciones del texto ya obtenido ---
-    # El texto ya está en `respuesta` de la primera llamada; lo partimos en oraciones para
-    # que hablar_stream pueda sintetizar cada una en cuanto esté lista (prefetch TTS).
+    # --- Ruta conversacional (sin Function Calling): emite oraciones para streaming TTS ---
     texto_conversacional = getattr(respuesta, 'text', '') or "No pude generar una respuesta."
     if "user safety: safe" in texto_conversacional.lower():
         texto_conversacional = "La respuesta fue filtrada por las políticas de seguridad del modelo."
@@ -433,6 +537,7 @@ def procesar_respuesta(comando):
         texto_completo = " ".join(texto_acumulado)
         historial_conversacion.append({"role": "user", "content": comando})
         historial_conversacion.append({"role": "assistant", "content": texto_completo})
+        _trimming_dinamico_historial()
 
     return _generador_con_historial()
 

@@ -3,7 +3,13 @@ import pygame
 import time
 import re
 
-from audio import hablar, hablar_stream, escuchar
+from audio import (
+    hablar, 
+    hablar_stream, 
+    escuchar, 
+    reproducir_chime_activacion, 
+    reproducir_chime_ejecucion
+)
 from cerebro import procesar_respuesta, generar_stream_oraciones, interrupcion_stream
 from agenda_y_tiempo import registrar_callback_voz, cargar_y_reprogramar_recordatorios_existentes
 from navegador_web import cerrar_navegador
@@ -31,6 +37,7 @@ try:
             variantes_nombre = ["cronos", "chronos", "chronnos", "crono", "kronos", "krono", "clonos"]
             
             if any(nombre in activacion_limpia for nombre in variantes_nombre):
+                reproducir_chime_activacion()
                 hablar("Te escucho.")
                 
                 while True:
@@ -58,9 +65,10 @@ try:
                     interrupcion_stream.clear()
                     respuesta = procesar_respuesta(comando)
                     # Si procesar_respuesta devuelve texto plano (ruta de herramientas/visión),
-                    # se habla directamente. Si devuelve un generador (ruta conversacional),
-                    # se usa hablar_stream para latencia mínima oración a oración.
+                    # se reproduce el chime de ejecución exitosa y se habla directamente.
+                    # Si devuelve un generador (ruta conversacional), se usa hablar_stream.
                     if isinstance(respuesta, str):
+                        reproducir_chime_ejecucion()
                         hablar(respuesta)
                     else:
                         hablar_stream(respuesta)

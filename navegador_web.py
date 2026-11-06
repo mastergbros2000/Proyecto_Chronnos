@@ -137,16 +137,34 @@ def _obtener_pagina_navegador(es_incognito: bool = False):
                 executable_path=ruta_opera
             )
             pagina_actual = contexto_actual.pages[0] if contexto_actual.pages else contexto_actual.new_page()
+
+        # Inyectar script anti-popups y supresión de banners de cookies a nivel de contexto
+        try:
+            script_anti_popups = """
+            window.addEventListener('DOMContentLoaded', () => {
+                const sel = 'div[class*="cookie" i], div[id*="cookie" i], div[class*="consent" i], div[id*="consent" i], div[class*="banner" i]';
+                document.querySelectorAll(sel).forEach(el => {
+                    try { el.style.display = 'none'; } catch(e){}
+                });
+            });
+            """
+            contexto_actual.add_init_script(script_anti_popups)
+        except Exception as e:
+            print(f"[Agente Web: Aviso al inyectar script anti-popups]: {e}")
     else:
-        # Reutilizar siempre la misma pestaña activa del contexto operativo existente
-        if pagina_actual is None or pagina_actual.is_closed():
-            paginas_vivas = [p for p in contexto_actual.pages if not p.is_closed()]
-            pagina_actual = paginas_vivas[0] if paginas_vivas else contexto_actual.new_page()
+        # Reutilizar siempre la misma pestaña activa del contexto operativo cerrando acumulaciones inactivas
+        paginas_vivas = [p for p in contexto_actual.pages if not p.is_closed()]
+        if len(paginas_vivas) > 1:
+            for extra in paginas_vivas[1:]:
+                try:
+                    extra.close()
+                except Exception:
+                    pass
+        pagina_actual = paginas_vivas[0] if paginas_vivas else contexto_actual.new_page()
             
     return pagina_actual
 
-def cerrar_navegador():
-    """Libera el motor Playwright y cierra las ventanas abiertas al apagar Chronnos."""
+def _tarea_cerrar_navegador():
     global motor_playwright, contexto_actual, pagina_actual
     try:
         if contexto_actual:
@@ -161,6 +179,69 @@ def cerrar_navegador():
     contexto_actual = None
     pagina_actual = None
     motor_playwright = None
+
+def cerrar_navegador():
+    """Libera el motor Playwright aislándolo en su propio hilo de ejecución sin errores de greenlet."""
+    try:
+        return executor_web.submit(_tarea_cerrar_navegador).result(timeout=6.0)
+    except Exception as e:
+        print(f"[Agente Web: Cierre de navegador gestionado]: {e}")
+
+def _tarea_cerrar_pestanas_secundarias() -> str:
+    global contexto_actual, pagina_actual
+    try:
+        if not _contexto_sigue_activo():
+            return "No hay ninguna ventana del navegador abierta."
+        paginas = [p for p in contexto_actual.pages if not p.is_closed()]
+        if len(paginas) <= 1:
+            return "Solo hay una pestaña activa en el navegador."
+        
+        cerradas = 0
+        pagina_principal = paginas[0]
+        for p in paginas[1:]:
+            try:
+                p.close()
+                cerradas += 1
+            except Exception:
+                pass
+        pagina_actual = pagina_principal
+        return f"He cerrado {cerradas} pestaña(s) secundaria(s), manteniendo únicamente la pestaña principal."
+    except Exception as e:
+        print(f"[Agente Web: Error al cerrar pestañas secundarias]: {e}")
+        return "No pude cerrar las pestañas secundarias."
+
+def cerrar_pestanas_secundarias() -> str:
+    return executor_web.submit(_tarea_cerrar_pestanas_secundarias).result()
+
+def _tarea_leer_pagina_actual() -> str:
+    try:
+        page = _obtener_pagina_navegador()
+        titulo = page.title()
+        
+        # Extraer texto de etiquetas semánticas y párrafos
+        try:
+            elementos = page.locator("article, main, p, h1, h2, h3").all_inner_texts()
+            texto_unido = " ".join([t.strip() for t in elementos if len(t.strip()) > 15])
+        except Exception:
+            texto_unido = ""
+            
+        if not texto_unido:
+            try:
+                texto_unido = page.inner_text("body")
+            except Exception:
+                texto_unido = ""
+                
+        fragmento = texto_unido[:3500].strip()
+        if not fragmento:
+            return f"La página '{titulo}' no tiene texto legible accesible."
+            
+        return f"Contenido de la página web '{titulo}':\n{fragmento}"
+    except Exception as e:
+        print(f"[Agente Web: Error al leer página actual]: {e}")
+        return "Ocurrió un error al intentar leer el contenido de la página web activa."
+
+def leer_pagina_actual() -> str:
+    return executor_web.submit(_tarea_leer_pagina_actual).result()
 
 def _tarea_navegar_a_url(url: str) -> str:
     try:

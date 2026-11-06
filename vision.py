@@ -33,6 +33,20 @@ def capturar_imagen() -> str | None:
         print("[Sistema: Error al capturar imagen del sensor]")
         return None
 
+def capturar_pantalla() -> str | None:
+    """Captura la pantalla completa del sistema para análisis visual multimodal."""
+    try:
+        print("\n[Visión: Capturando pantalla completa...]")
+        from PIL import ImageGrab
+        captura = ImageGrab.grab()
+        ruta = "captura_pantalla_temporal.jpg"
+        captura.convert("RGB").save(ruta, format="JPEG", quality=85)
+        print("[Visión: Captura de pantalla completada]")
+        return ruta
+    except Exception as e:
+        print(f"[Visión: Error al capturar pantalla]: {e}")
+        return None
+
 def inspeccionar_imagen_local(ruta: str) -> dict | None:
     """Obtiene metadatos detallados de una imagen local sin bloquear el archivo."""
     try:

@@ -10,11 +10,65 @@ import re
 import threading
 import queue
 import time as _time
+import math
+import struct
+import wave
 
 pygame.mixer.init()
 
 reproduciendo_audio = False
 interrupcion_solicitada = False
+
+def _crear_chime_wav(frecuencias: list[tuple[float, float]], duracion_total: float = 0.15) -> io.BytesIO:
+    """Genera en memoria RAM un micro-buffer WAV senoidal con envolvente suave para chimes en 0 ms."""
+    samplerate = 22050
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(samplerate)
+        
+        n_muestras = int(samplerate * duracion_total)
+        muestras = []
+        for i in range(n_muestras):
+            t = i / samplerate
+            envolvente = math.exp(-4.0 * (t / duracion_total))
+            muestra = 0.0
+            for freq, amp in frecuencias:
+                muestra += amp * math.sin(2.0 * math.pi * freq * t)
+            muestra = int(max(-32767, min(32767, muestra * envolvente * 16000)))
+            muestras.append(struct.pack('<h', muestra))
+        wav_file.writeframes(b''.join(muestras))
+    buffer.seek(0)
+    return buffer
+
+chime_activacion_sound = None
+chime_ejecucion_sound = None
+
+try:
+    buf_act = _crear_chime_wav([(1046.50, 0.6), (1318.51, 0.4)], duracion_total=0.12)
+    chime_activacion_sound = pygame.mixer.Sound(buf_act)
+    
+    buf_ejec = _crear_chime_wav([(587.33, 0.5), (880.00, 0.5)], duracion_total=0.16)
+    chime_ejecucion_sound = pygame.mixer.Sound(buf_ejec)
+except Exception as e:
+    print(f"[Audio Chimes: Inicialización]: {e}")
+
+def reproducir_chime_activacion():
+    """Chime instantáneo en 0 ms al detectar la wake-word 'Chronnos'."""
+    if chime_activacion_sound:
+        try:
+            chime_activacion_sound.play()
+        except Exception:
+            pass
+
+def reproducir_chime_ejecucion():
+    """Chime suave al concluir exitosamente una acción física o herramienta."""
+    if chime_ejecucion_sound:
+        try:
+            chime_ejecucion_sound.play()
+        except Exception:
+            pass
 
 def restaurar_puntuacion(texto: str) -> str:
     """Restaura puntuación y preguntas preservando límites de palabras."""
@@ -54,9 +108,9 @@ def restaurar_puntuacion(texto: str) -> str:
             
     return texto
 
-async def _generar_bytes_voz(texto: str, voz: str = "es-CL-LorenzoNeural") -> io.BytesIO:
+async def _generar_bytes_voz(texto: str, voz: str = "es-CL-LorenzoNeural", rate: str = "+0%") -> io.BytesIO:
     texto_limpio = texto.replace("*", "").replace("#", "").replace("`", "")
-    communicate = edge_tts.Communicate(texto_limpio, voz)
+    communicate = edge_tts.Communicate(texto_limpio, voz, rate=rate)
     buffer = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
@@ -85,13 +139,17 @@ def _monitor_barge_in(reconocedor, stop_event):
     except Exception:
         pass
 
-def hablar(texto: str, voz: str = "es-CL-LorenzoNeural"):
-    """Sintetiza y reproduce audio con descarga de memoria y escucha de interrupción."""
+def hablar(texto: str, voz: str = "es-CL-LorenzoNeural", rate: str = None):
+    """Sintetiza y reproduce audio con velocidad dinámica y escucha de interrupción."""
     global reproduciendo_audio, interrupcion_solicitada
     interrupcion_solicitada = False
     
     if not texto or not texto.strip():
         return
+
+    # Escalamiento dinámico: confirmaciones breves más rápidas (+15%), explicaciones a ritmo normal (+0%)
+    if rate is None:
+        rate = "+15%" if len(texto.split()) <= 7 else "+0%"
 
     print(f"Chronnos: {texto}")
     buffer_audio = None
@@ -99,7 +157,7 @@ def hablar(texto: str, voz: str = "es-CL-LorenzoNeural"):
     hilo_barge_in = None
     
     try:
-        buffer_audio = asyncio.run(_generar_bytes_voz(texto, voz))
+        buffer_audio = asyncio.run(_generar_bytes_voz(texto, voz, rate=rate))
         
         pygame.mixer.music.load(buffer_audio)
         pygame.mixer.music.play()
@@ -233,29 +291,36 @@ def detener_habla():
         pass
 
 def escuchar(silencioso=False) -> str | None:
-    reconocedor = sr.Recognizer()
-    reconocedor.pause_threshold = 1.3
-    reconocedor.non_speaking_duration = 0.5
-    
-    with sr.Microphone() as fuente:
-        reconocedor.dynamic_energy_threshold = True
-        reconocedor.adjust_for_ambient_noise(fuente, duration=0.3) 
+    """Captura audio del micrófono con calibración anti-eco y re-bind autónomo."""
+    try:
+        reconocedor = sr.Recognizer()
+        # Calibración estricta anti-eco: umbral fijo de 1200 y pausa de 1.0s para ignorar eco de altavoces
+        reconocedor.dynamic_energy_threshold = False
+        reconocedor.energy_threshold = 1200
+        reconocedor.pause_threshold = 1.0
+        reconocedor.non_speaking_duration = 0.4
         
-        if not silencioso:
-            print("\n[Escuchando... Ya puedes hablar]")
-        
-        try:
-            audio = reconocedor.listen(fuente, timeout=5, phrase_time_limit=15)
-            texto_bruto = reconocedor.recognize_google(audio, language="es-ES")
-            texto_procesado = restaurar_puntuacion(texto_bruto)
+        with sr.Microphone() as fuente:
+            if not silencioso:
+                print("\n[Escuchando... Ya puedes hablar]")
             
-            if not silencioso and texto_procesado:
-                print(f"Tú: {texto_procesado}")
+            try:
+                audio = reconocedor.listen(fuente, timeout=5, phrase_time_limit=15)
+                texto_bruto = reconocedor.recognize_google(audio, language="es-ES")
+                texto_procesado = restaurar_puntuacion(texto_bruto)
                 
-            return texto_procesado
-            
-        except (sr.WaitTimeoutError, sr.UnknownValueError):
-            return None
-        except sr.RequestError:
-            print("[Error de conexión en el micrófono]")
-            return None
+                if not silencioso and texto_procesado:
+                    print(f"Tú: {texto_procesado}")
+                    
+                return texto_procesado
+                
+            except (sr.WaitTimeoutError, sr.UnknownValueError):
+                return None
+            except sr.RequestError as e:
+                print(f"[Audio: Error de conexión en servicio de voz]: {e}")
+                return None
+    except Exception as hardware_err:
+        # Re-bind autónomo ante desconexiones de hardware o micro Bluetooth/USB
+        print(f"[Audio: Alerta de hardware en micrófono, re-intentando enlace]: {hardware_err}")
+        _time.sleep(0.5)
+        return None
