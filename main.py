@@ -2,6 +2,7 @@ import sys
 import pygame
 import time
 import re
+import unicodedata
 
 from audio import (
     hablar, 
@@ -28,15 +29,38 @@ def apagar_sistema():
     pygame.mixer.quit()
     sys.exit(0)
 
+VARIANTES_CRONOS = {
+    "cronos", "chronos", "chronnos", "crono", "chrono", "kronos", "krono", 
+    "clonos", "clono", "coronos", "trono", "tronos", "cronus", "kronus",
+    "prono", "pronos", "conos", "cono", "colonos"
+}
+
+def normalizar_wake_word(texto: str) -> list[str]:
+    """Limpia estrictamente signos de puntuación, acentos y símbolos dejando palabras limpias."""
+    if not texto:
+        return []
+    texto_sin_acentos = "".join(
+        c for c in unicodedata.normalize('NFD', texto.lower().strip())
+        if unicodedata.category(c) != 'Mn'
+    )
+    tokens = re.findall(r'[a-z0-9]+', texto_sin_acentos)
+    return tokens
+
 try:
     while True:
-        activacion = escuchar(silencioso=True)
+        # Escucha en reposo optimizada para captar la palabra aislada en milisegundos
+        activacion = escuchar(silencioso=True, es_wake_word=True)
         
         if activacion:
-            activacion_limpia = re.sub(r'[^\w\s]', '', activacion.lower())
-            variantes_nombre = ["cronos", "chronos", "chronnos", "crono", "kronos", "krono", "clonos"]
+            palabras = normalizar_wake_word(activacion)
+            # Detección ultra-sensible de Cronos aislado o en frase
+            cadena_unida = "".join(palabras)
+            es_cronos = (
+                any(p in VARIANTES_CRONOS for p in palabras) or 
+                any(raiz in cadena_unida for raiz in ["crono", "chrono", "krono", "clono"])
+            )
             
-            if any(nombre in activacion_limpia for nombre in variantes_nombre):
+            if es_cronos:
                 reproducir_chime_activacion()
                 hablar("Te escucho.")
                 

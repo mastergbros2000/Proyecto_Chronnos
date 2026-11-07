@@ -118,29 +118,8 @@ async def _generar_bytes_voz(texto: str, voz: str = "es-CL-LorenzoNeural", rate:
     buffer.seek(0)
     return buffer
 
-def _monitor_barge_in(reconocedor, stop_event):
-    """Monitorea el micrófono mientras Chronnos habla para permitir interrupción (Barge-In)."""
-    global interrupcion_solicitada
-    try:
-        with sr.Microphone() as fuente:
-            reconocedor.energy_threshold = max(reconocedor.energy_threshold, 3500)
-            while not stop_event.is_set():
-                try:
-                    reconocedor.listen(fuente, timeout=0.4, phrase_time_limit=1.0)
-                    if not stop_event.is_set():
-                        interrupcion_solicitada = True
-                        pygame.mixer.music.stop()
-                        print("\n[Hablar: Interrupción de voz detectada (Barge-In)]")
-                        break
-                except sr.WaitTimeoutError:
-                    continue
-                except Exception:
-                    break
-    except Exception:
-        pass
-
 def hablar(texto: str, voz: str = "es-CL-LorenzoNeural", rate: str = None):
-    """Sintetiza y reproduce audio con velocidad dinámica y escucha de interrupción."""
+    """Sintetiza y reproduce audio con velocidad dinámica. Respuesta completa sin auto-interrupción por altavoces."""
     global reproduciendo_audio, interrupcion_solicitada
     interrupcion_solicitada = False
     
@@ -153,8 +132,6 @@ def hablar(texto: str, voz: str = "es-CL-LorenzoNeural", rate: str = None):
 
     print(f"Chronnos: {texto}")
     buffer_audio = None
-    stop_event = threading.Event()
-    hilo_barge_in = None
     
     try:
         buffer_audio = asyncio.run(_generar_bytes_voz(texto, voz, rate=rate))
@@ -163,21 +140,16 @@ def hablar(texto: str, voz: str = "es-CL-LorenzoNeural", rate: str = None):
         pygame.mixer.music.play()
         reproduciendo_audio = True
         
-        # Inicia escucha en segundo plano para Barge-In
-        reconocedor_barge_in = sr.Recognizer()
-        hilo_barge_in = threading.Thread(target=_monitor_barge_in, args=(reconocedor_barge_in, stop_event), daemon=True)
-        hilo_barge_in.start()
-        
+        # Reproducción completa sin cortes de altavoces
         while pygame.mixer.music.get_busy():
             if interrupcion_solicitada:
                 pygame.mixer.music.stop()
                 break
-            pygame.time.wait(30)
+            pygame.time.wait(25)
             
     except Exception as e:
         print(f"[Error de Voz TTS]: {e}")
     finally:
-        stop_event.set()
         reproduciendo_audio = False
         try:
             pygame.mixer.music.stop()
@@ -197,7 +169,7 @@ def hablar_stream(iterador_oraciones, voz: str = "es-CL-LorenzoNeural"):
     sintetiza cada una con edge-tts y la reproduce en cuanto esté lista.
     El audio de la oración N+1 se prepara en un hilo de prefetch mientras
     se reproduce la oración N, eliminando el tiempo muerto entre frases.
-    Soporta interrupción por Barge-In igual que hablar().
+    Respuestas completas sin auto-interrupción por altavoces.
     """
     global reproduciendo_audio, interrupcion_solicitada
     interrupcion_solicitada = False
@@ -221,15 +193,6 @@ def hablar_stream(iterador_oraciones, voz: str = "es-CL-LorenzoNeural"):
 
     hilo_sintetizador = threading.Thread(target=_sintetizar_worker, daemon=True)
     hilo_sintetizador.start()
-
-    stop_event = threading.Event()
-    reconocedor_barge_in = sr.Recognizer()
-    hilo_barge_in = threading.Thread(
-        target=_monitor_barge_in,
-        args=(reconocedor_barge_in, stop_event),
-        daemon=True
-    )
-    hilo_barge_in.start()
 
     reproduciendo_audio = True
     buffer_actual = None
@@ -273,7 +236,6 @@ def hablar_stream(iterador_oraciones, voz: str = "es-CL-LorenzoNeural"):
     except Exception as e:
         print(f"[Error en hablar_stream: {e}]")
     finally:
-        stop_event.set()
         reproduciendo_audio = False
         try:
             pygame.mixer.music.stop()
@@ -290,22 +252,33 @@ def detener_habla():
     except Exception:
         pass
 
-def escuchar(silencioso=False) -> str | None:
-    """Captura audio del micrófono con calibración anti-eco y re-bind autónomo."""
+def escuchar(silencioso=False, es_wake_word=False) -> str | None:
+    """Captura audio del micrófono bifurcando configuración entre Modo Reposo y Modo Comando Activo."""
     try:
         reconocedor = sr.Recognizer()
-        # Calibración estricta anti-eco: umbral fijo de 1200 y pausa de 1.0s para ignorar eco de altavoces
-        reconocedor.dynamic_energy_threshold = False
-        reconocedor.energy_threshold = 1200
-        reconocedor.pause_threshold = 1.0
-        reconocedor.non_speaking_duration = 0.4
         
         with sr.Microphone() as fuente:
-            if not silencioso:
+            if silencioso or es_wake_word:
+                # 1. Modo Reposo: sin recalibración ambiental, umbral estático de 300 y tiempos rápidos
+                reconocedor.dynamic_energy_threshold = False
+                reconocedor.energy_threshold = 300
+                reconocedor.pause_threshold = 0.5
+                reconocedor.non_speaking_duration = 0.2
+                timeout_escucha = 2.0
+                limite_tiempo_frase = 3.0
+            else:
+                # 2. Modo Comando Activo: recalibración ambiental de 0.3s, dynamic activo y umbral 400
+                reconocedor.adjust_for_ambient_noise(fuente, duration=0.3)
+                reconocedor.dynamic_energy_threshold = True
+                reconocedor.energy_threshold = 400
+                reconocedor.pause_threshold = 0.8
+                reconocedor.non_speaking_duration = 0.4
+                timeout_escucha = 5.0
+                limite_tiempo_frase = 10.0
                 print("\n[Escuchando... Ya puedes hablar]")
             
             try:
-                audio = reconocedor.listen(fuente, timeout=5, phrase_time_limit=15)
+                audio = reconocedor.listen(fuente, timeout=timeout_escucha, phrase_time_limit=limite_tiempo_frase)
                 texto_bruto = reconocedor.recognize_google(audio, language="es-ES")
                 texto_procesado = restaurar_puntuacion(texto_bruto)
                 
@@ -322,5 +295,5 @@ def escuchar(silencioso=False) -> str | None:
     except Exception as hardware_err:
         # Re-bind autónomo ante desconexiones de hardware o micro Bluetooth/USB
         print(f"[Audio: Alerta de hardware en micrófono, re-intentando enlace]: {hardware_err}")
-        _time.sleep(0.5)
+        _time.sleep(0.4)
         return None

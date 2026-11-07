@@ -1,3 +1,5 @@
 venv/
 .env
 __pycache__/
+captura_pantalla_temporal.jpg
+*.tmp

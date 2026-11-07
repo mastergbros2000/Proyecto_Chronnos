@@ -73,16 +73,30 @@ def sincronizar_perfil_opera():
 
     print("[Agente Web: Sincronizando perfil de Opera GX hacia el perfil de Chronnos...]")
 
-    # Archivo Local State en la raíz del perfil de origen
-    local_state_src = origen_base / "Local State"
-    if local_state_src.exists():
-        _copiar_archivo_seguro(local_state_src, destino_base / "Local State")
+    # Archivos clave en la raíz del perfil de origen
+    archivos_raiz = ["Local State", "auth_account", "siteprefs.json"]
+    for arc in archivos_raiz:
+        arc_src = origen_base / arc
+        if arc_src.exists():
+            _copiar_archivo_seguro(arc_src, destino_base / arc)
 
     # Elementos clave dentro de la subcarpeta Default
     origen_default = origen_base / "Default"
     destino_default = destino_base / "Default"
 
-    elementos_clave = ["Network", "Local Storage", "Session Storage", "Preferences", "Login Data"]
+    elementos_clave = [
+        "Network",              # Cookies y parámetros de conexión
+        "Local Storage",        # Almacenamiento local web (sesiones)
+        "Session Storage",      # Sesiones de navegación
+        "IndexedDB",            # Almacenamiento web persistente
+        "Sessions",             # Sesiones y pestañas guardadas
+        "Preferences",          # Preferencias del usuario
+        "Secure Preferences",   # Tokens seguros y extensiones
+        "Web Data",             # Logins y autofill
+        "Login Data",           # Credenciales y cuentas
+        "auth_account",         # Cuenta autenticada Opera
+        "Extension Cookies"     # Cookies de extensiones
+    ]
     for elemento in elementos_clave:
         src_item = origen_default / elemento
         dst_item = destino_default / elemento
@@ -93,7 +107,7 @@ def sincronizar_perfil_opera():
         else:
             _copiar_archivo_seguro(src_item, dst_item)
 
-    print("[Agente Web: Sincronización de perfil completada.]")
+    print("[Agente Web: Sincronización de perfil y cuentas completada.]")
 
 def _contexto_sigue_activo() -> bool:
     """Verifica de forma segura si el contexto de Playwright está conectado y abierto."""
@@ -134,8 +148,15 @@ def _obtener_pagina_navegador(es_incognito: bool = False):
             contexto_actual = motor_playwright.chromium.launch_persistent_context(
                 user_data_dir=perfil_dir,
                 headless=False,
-                executable_path=ruta_opera
+                executable_path=ruta_opera,
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled"
+                ],
+                ignore_default_args=["--disable-component-update"]
             )
+            # Reutilizar la pestaña inicial creada por Playwright para evitar duplicar about:blank
             pagina_actual = contexto_actual.pages[0] if contexto_actual.pages else contexto_actual.new_page()
 
         # Inyectar script anti-popups y supresión de banners de cookies a nivel de contexto
@@ -163,6 +184,36 @@ def _obtener_pagina_navegador(es_incognito: bool = False):
         pagina_actual = paginas_vivas[0] if paginas_vivas else contexto_actual.new_page()
             
     return pagina_actual
+
+def _limpiar_pestanas_iniciales_y_vacias():
+    """Identifica y cierra automáticamente pestañas 'about:blank' o vacías iniciales para dejar solo la del usuario."""
+    global contexto_actual, pagina_actual
+    if not _contexto_sigue_activo():
+        return
+    try:
+        paginas = [p for p in contexto_actual.pages if not p.is_closed()]
+        if len(paginas) <= 1:
+            return
+
+        paginas_activas = []
+        for p in paginas:
+            url_p = p.url.lower().strip()
+            # Identificar pestañas en blanco o de bienvenida que ya no se usan
+            if url_p in ["about:blank", "data:,", "chrome://startpage/", "opera://startpage/"]:
+                try:
+                    p.close()
+                    print("[Agente Web: Pestaña en blanco/inicial cerrada automáticamente]")
+                except Exception:
+                    pass
+            else:
+                paginas_activas.append(p)
+
+        if paginas_activas:
+            pagina_actual = paginas_activas[-1]
+        elif contexto_actual.pages:
+            pagina_actual = contexto_actual.pages[0]
+    except Exception as e:
+        print(f"[Agente Web: Aviso al limpiar pestañas vacías]: {e}")
 
 def _tarea_cerrar_navegador():
     global motor_playwright, contexto_actual, pagina_actual
@@ -259,6 +310,8 @@ def _tarea_navegar_a_url(url: str) -> str:
                 raise e
 
         titulo = page.title()
+        # Limpiar automáticamente pestañas iniciales vacías o about:blank dejando únicamente la pestaña solicitada
+        _limpiar_pestanas_iniciales_y_vacias()
         return f"He navegado a '{url}'. Título: '{titulo}'."
     except Exception as e:
         print(f"[Error del Agente Web (Navegar): {e}]")
@@ -318,6 +371,8 @@ def _tarea_reproducir_youtube(busqueda: str) -> str:
         time.sleep(1)
         primer_video = page.locator('ytd-video-renderer a#video-title').first
         primer_video.click()
+        # Limpiar automáticamente pestañas iniciales vacías dejando solo la de YouTube
+        _limpiar_pestanas_iniciales_y_vacias()
         return f"He buscado y reproducido el video sobre '{busqueda}' en YouTube exitosamente."
     except Exception as e:
         print(f"[Error del Agente Web (YouTube): {e}]")
@@ -341,6 +396,7 @@ def _tarea_buscar_mercadolibre(producto: str) -> str:
         page.fill('input.cb1-edit', producto)
         page.press('input.cb1-edit', 'Enter')
         page.wait_for_selector('li.ui-search-layout__item', timeout=15000)
+        _limpiar_pestanas_iniciales_y_vacias()
         return f"He realizado la búsqueda de '{producto}' en Mercado Libre."
     except Exception as e:
         print(f"[Error del Agente Web (Mercado Libre): {e}]")
