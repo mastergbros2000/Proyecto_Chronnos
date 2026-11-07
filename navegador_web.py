@@ -1,11 +1,13 @@
 from playwright.sync_api import sync_playwright
 import time
 import os
+import shutil
 import subprocess
 import concurrent.futures
 import psutil
+import webbrowser
+from pathlib import Path
 
-# Hilo dedicado para evitar bloqueos con asyncio/audio
 executor_web = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 motor_playwright = None
@@ -26,7 +28,6 @@ def _buscar_ejecutable_opera() -> str | None:
     return None
 
 def _opera_esta_abierto() -> bool:
-    """Verifica si el navegador Opera o Opera GX está en ejecución."""
     for proc in psutil.process_iter(['name']):
         try:
             if proc.info['name'] and 'opera' in proc.info['name'].lower():
@@ -35,14 +36,102 @@ def _opera_esta_abierto() -> bool:
             pass
     return False
 
+def sincronizar_perfil_opera():
+    """
+    Copia los archivos de sesión clave del perfil real de Opera GX
+    hacia el perfil aislado de Chronnos (.chronnos_opera_profile).
+    Omite archivos bloqueados si Opera GX está en ejecución simultáneamente.
+    """
+    appdata = os.getenv("APPDATA", "")
+    origen_base = Path(appdata) / "Opera Software" / "Opera GX Stable"
+    destino_base = Path(os.path.expanduser("~")) / ".chronnos_opera_profile"
+
+    if not origen_base.exists():
+        print("[Agente Web: Perfil de Opera GX no encontrado. Omitiendo sincronización.]")
+        return
+
+    def _copiar_archivo_seguro(src: Path, dst: Path):
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except (PermissionError, OSError) as e:
+            print(f"[Agente Web: Archivo omitido por bloqueo del sistema — {src.name}: {e}]")
+
+    def _copiar_directorio_seguro(src_dir: Path, dst_dir: Path):
+        try:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            for raiz, _, archivos in os.walk(src_dir):
+                rel = Path(raiz).relative_to(src_dir)
+                target_sub = dst_dir / rel
+                target_sub.mkdir(parents=True, exist_ok=True)
+                for archivo in archivos:
+                    if archivo.endswith(".tmp") or archivo == "LOCK":
+                        continue
+                    _copiar_archivo_seguro(Path(raiz) / archivo, target_sub / archivo)
+        except (PermissionError, OSError) as e:
+            print(f"[Agente Web: Directorio omitido por bloqueo — {src_dir.name}: {e}]")
+
+    print("[Agente Web: Sincronizando perfil de Opera GX hacia el perfil de Chronnos...]")
+
+    # Archivos clave en la raíz del perfil de origen
+    archivos_raiz = ["Local State", "auth_account", "siteprefs.json"]
+    for arc in archivos_raiz:
+        arc_src = origen_base / arc
+        if arc_src.exists():
+            _copiar_archivo_seguro(arc_src, destino_base / arc)
+
+    # Elementos clave dentro de la subcarpeta Default
+    origen_default = origen_base / "Default"
+    destino_default = destino_base / "Default"
+
+    elementos_clave = [
+        "Network",              # Cookies y parámetros de conexión
+        "Local Storage",        # Almacenamiento local web (sesiones)
+        "Session Storage",      # Sesiones de navegación
+        "IndexedDB",            # Almacenamiento web persistente
+        "Sessions",             # Sesiones y pestañas guardadas
+        "Preferences",          # Preferencias del usuario
+        "Secure Preferences",   # Tokens seguros y extensiones
+        "Web Data",             # Logins y autofill
+        "Login Data",           # Credenciales y cuentas
+        "auth_account",         # Cuenta autenticada Opera
+        "Extension Cookies"     # Cookies de extensiones
+    ]
+    for elemento in elementos_clave:
+        src_item = origen_default / elemento
+        dst_item = destino_default / elemento
+        if not src_item.exists():
+            continue
+        if src_item.is_dir():
+            _copiar_directorio_seguro(src_item, dst_item)
+        else:
+            _copiar_archivo_seguro(src_item, dst_item)
+
+    print("[Agente Web: Sincronización de perfil y cuentas completada.]")
+
+def _contexto_sigue_activo() -> bool:
+    """Verifica de forma segura si el contexto de Playwright está conectado y abierto."""
+    global contexto_actual
+    if contexto_actual is None:
+        return False
+    try:
+        pages = contexto_actual.pages
+        for p in pages:
+            if not p.is_closed():
+                return True
+        return False
+    except Exception:
+        return False
+
 def _obtener_pagina_navegador(es_incognito: bool = False):
+    """Obtiene la página activa reutilizando la pestaña y contexto sin abrir ventanas duplicadas."""
     global motor_playwright, contexto_actual, pagina_actual
-    
     ruta_opera = _buscar_ejecutable_opera()
     
-    if contexto_actual is None or not contexto_actual.browser.is_connected():
-        motor_playwright = sync_playwright().start()
-        
+    if not _contexto_sigue_activo():
+        if motor_playwright is None:
+            motor_playwright = sync_playwright().start()
+            
         if es_incognito:
             print("\n[Agente Web: Abriendo ventana de Incógnito...]")
             browser = motor_playwright.chromium.launch(
@@ -53,105 +142,183 @@ def _obtener_pagina_navegador(es_incognito: bool = False):
             contexto_actual = browser.new_context()
             pagina_actual = contexto_actual.new_page()
         else:
-            print("\n[Agente Web: Abriendo ventana normal con perfil guardado...]")
+            print("\n[Agente Web: Conectando a ventana de automatización con perfil...]")
             perfil_dir = os.path.join(os.path.expanduser("~"), ".chronnos_opera_profile")
+            sincronizar_perfil_opera()
             contexto_actual = motor_playwright.chromium.launch_persistent_context(
                 user_data_dir=perfil_dir,
                 headless=False,
-                executable_path=ruta_opera
+                executable_path=ruta_opera,
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled"
+                ],
+                ignore_default_args=["--disable-component-update"]
             )
+            # Reutilizar la pestaña inicial creada por Playwright para evitar duplicar about:blank
             pagina_actual = contexto_actual.pages[0] if contexto_actual.pages else contexto_actual.new_page()
+
+        # Inyectar script anti-popups y supresión de banners de cookies a nivel de contexto
+        try:
+            script_anti_popups = """
+            window.addEventListener('DOMContentLoaded', () => {
+                const sel = 'div[class*="cookie" i], div[id*="cookie" i], div[class*="consent" i], div[id*="consent" i], div[class*="banner" i]';
+                document.querySelectorAll(sel).forEach(el => {
+                    try { el.style.display = 'none'; } catch(e){}
+                });
+            });
+            """
+            contexto_actual.add_init_script(script_anti_popups)
+        except Exception as e:
+            print(f"[Agente Web: Aviso al inyectar script anti-popups]: {e}")
+    else:
+        # Reutilizar siempre la misma pestaña activa del contexto operativo cerrando acumulaciones inactivas
+        paginas_vivas = [p for p in contexto_actual.pages if not p.is_closed()]
+        if len(paginas_vivas) > 1:
+            for extra in paginas_vivas[1:]:
+                try:
+                    extra.close()
+                except Exception:
+                    pass
+        pagina_actual = paginas_vivas[0] if paginas_vivas else contexto_actual.new_page()
             
     return pagina_actual
 
-# =========================================================================
-# FLUJOS DE TRABAJO ESPECIALIZADOS
-# =========================================================================
-
-def _tarea_reproducir_youtube(busqueda: str, comando_original: str = "") -> str:
+def _limpiar_pestanas_iniciales_y_vacias():
+    """Identifica y cierra automáticamente pestañas 'about:blank' o vacías iniciales para dejar solo la del usuario."""
+    global contexto_actual, pagina_actual
+    if not _contexto_sigue_activo():
+        return
     try:
-        es_incognito = any(p in comando_original.lower() for p in ["incognito", "incógnito", "privada", "ventana privada"])
-        ruta_opera = _buscar_ejecutable_opera()
-        
-        # 1. Si Opera ya está abierto y no se pidió incógnito, abre una pestaña directa
-        if _opera_esta_abierto() and not es_incognito and contexto_actual is None:
-            print("\n[Agente Web: Opera activo detectado. Abriendo nueva pestaña...]")
-            url_busqueda = f"https://www.youtube.com/results?search_query={busqueda.replace(' ', '+')}"
-            if ruta_opera:
-                subprocess.Popen([ruta_opera, url_busqueda])
+        paginas = [p for p in contexto_actual.pages if not p.is_closed()]
+        if len(paginas) <= 1:
+            return
+
+        paginas_activas = []
+        for p in paginas:
+            url_p = p.url.lower().strip()
+            # Identificar pestañas en blanco o de bienvenida que ya no se usan
+            if url_p in ["about:blank", "data:,", "chrome://startpage/", "opera://startpage/"]:
+                try:
+                    p.close()
+                    print("[Agente Web: Pestaña en blanco/inicial cerrada automáticamente]")
+                except Exception:
+                    pass
             else:
-                import webbrowser
-                webbrowser.open(url_busqueda)
-            return f"He abierto la búsqueda de '{busqueda}' en tu navegador."
+                paginas_activas.append(p)
 
-        # 2. Si está cerrado o se requiere modo incógnito / automatización por Playwright
-        page = _obtener_pagina_navegador(es_incognito=es_incognito)
-        page.goto("https://www.youtube.com")
-        
-        try:
-            page.click('button[aria-label*="Aceptar"]', timeout=3000)
-        except Exception:
-            pass
-
-        page.wait_for_selector('input[name="search_query"]', timeout=15000)
-        page.fill('input[name="search_query"]', busqueda)
-        page.press('input[name="search_query"]', 'Enter')
-        
-        page.wait_for_selector('ytd-video-renderer', timeout=15000)
-        time.sleep(1)
-        
-        primer_video = page.locator('ytd-video-renderer a#video-title').first
-        primer_video.click()
-        
-        return f"He buscado y reproducido '{busqueda}' en YouTube exitosamente."
-        
+        if paginas_activas:
+            pagina_actual = paginas_activas[-1]
+        elif contexto_actual.pages:
+            pagina_actual = contexto_actual.pages[0]
     except Exception as e:
-        print(f"[Error del Agente Web (YouTube): {e}]")
-        return "Ocurrió un error al intentar reproducir el video en YouTube."
+        print(f"[Agente Web: Aviso al limpiar pestañas vacías]: {e}")
 
-def buscar_y_reproducir_youtube(busqueda: str) -> str:
-    future = executor_web.submit(_tarea_reproducir_youtube, busqueda)
-    return future.result()
+def _tarea_cerrar_navegador():
+    global motor_playwright, contexto_actual, pagina_actual
+    try:
+        if contexto_actual:
+            contexto_actual.close()
+    except Exception as e:
+        print(f"[Agente Web: Cierre de contexto]: {e}")
+    try:
+        if motor_playwright:
+            motor_playwright.stop()
+    except Exception as e:
+        print(f"[Agente Web: Parada de motor Playwright]: {e}")
+    contexto_actual = None
+    pagina_actual = None
+    motor_playwright = None
 
-def _tarea_buscar_mercadolibre(producto: str) -> str:
+def cerrar_navegador():
+    """Libera el motor Playwright aislándolo en su propio hilo de ejecución sin errores de greenlet."""
+    try:
+        return executor_web.submit(_tarea_cerrar_navegador).result(timeout=6.0)
+    except Exception as e:
+        print(f"[Agente Web: Cierre de navegador gestionado]: {e}")
+
+def _tarea_cerrar_pestanas_secundarias() -> str:
+    global contexto_actual, pagina_actual
+    try:
+        if not _contexto_sigue_activo():
+            return "No hay ninguna ventana del navegador abierta."
+        paginas = [p for p in contexto_actual.pages if not p.is_closed()]
+        if len(paginas) <= 1:
+            return "Solo hay una pestaña activa en el navegador."
+        
+        cerradas = 0
+        pagina_principal = paginas[0]
+        for p in paginas[1:]:
+            try:
+                p.close()
+                cerradas += 1
+            except Exception:
+                pass
+        pagina_actual = pagina_principal
+        return f"He cerrado {cerradas} pestaña(s) secundaria(s), manteniendo únicamente la pestaña principal."
+    except Exception as e:
+        print(f"[Agente Web: Error al cerrar pestañas secundarias]: {e}")
+        return "No pude cerrar las pestañas secundarias."
+
+def cerrar_pestanas_secundarias() -> str:
+    return executor_web.submit(_tarea_cerrar_pestanas_secundarias).result()
+
+def _tarea_leer_pagina_actual() -> str:
     try:
         page = _obtener_pagina_navegador()
-        page.goto("https://www.mercadolibre.cl/")
+        titulo = page.title()
         
-        page.wait_for_selector('input.cb1-edit', timeout=15000)
-        page.fill('input.cb1-edit', producto)
-        page.press('input.cb1-edit', 'Enter')
-        
-        page.wait_for_selector('li.ui-search-layout__item', timeout=15000)
-        return f"He realizado la búsqueda de '{producto}' en Mercado Libre."
-        
+        # Extraer texto de etiquetas semánticas y párrafos
+        try:
+            elementos = page.locator("article, main, p, h1, h2, h3").all_inner_texts()
+            texto_unido = " ".join([t.strip() for t in elementos if len(t.strip()) > 15])
+        except Exception:
+            texto_unido = ""
+            
+        if not texto_unido:
+            try:
+                texto_unido = page.inner_text("body")
+            except Exception:
+                texto_unido = ""
+                
+        fragmento = texto_unido[:3500].strip()
+        if not fragmento:
+            return f"La página '{titulo}' no tiene texto legible accesible."
+            
+        return f"Contenido de la página web '{titulo}':\n{fragmento}"
     except Exception as e:
-        print(f"[Error del Agente Web (Mercado Libre): {e}]")
-        return "Ocurrió un error al buscar en Mercado Libre."
+        print(f"[Agente Web: Error al leer página actual]: {e}")
+        return "Ocurrió un error al intentar leer el contenido de la página web activa."
 
-def buscar_mercadolibre(producto: str) -> str:
-    future = executor_web.submit(_tarea_buscar_mercadolibre, producto)
-    return future.result()
-
-# =========================================================================
-# HERRAMIENTAS WEB UNIVERSALES
-# =========================================================================
+def leer_pagina_actual() -> str:
+    return executor_web.submit(_tarea_leer_pagina_actual).result()
 
 def _tarea_navegar_a_url(url: str) -> str:
     try:
-        page = _obtener_pagina_navegador()
         if not url.startswith("http://") and not url.startswith("https://"):
             url = "https://" + url
-        page.goto(url, timeout=20000)
+
+        page = _obtener_pagina_navegador(es_incognito=False)
+        try:
+            # wait_until domcontentloaded para evitar cancelaciones net::ERR_ABORTED por recursos secundarios
+            page.goto(url, timeout=25000, wait_until="domcontentloaded")
+        except Exception as e:
+            if "ERR_ABORTED" in str(e):
+                print(f"[Agente Web: Solicitud secundaria abortada tolerada en navegación]")
+            else:
+                raise e
+
         titulo = page.title()
-        return f"He navegado con éxito a '{url}'. Título: '{titulo}'."
+        # Limpiar automáticamente pestañas iniciales vacías o about:blank dejando únicamente la pestaña solicitada
+        _limpiar_pestanas_iniciales_y_vacias()
+        return f"He navegado a '{url}'. Título: '{titulo}'."
     except Exception as e:
         print(f"[Error del Agente Web (Navegar): {e}]")
         return f"Ocurrió un error al intentar navegar a '{url}'."
 
 def navegar_a_url(url: str) -> str:
-    future = executor_web.submit(_tarea_navegar_a_url, url)
-    return future.result()
+    return executor_web.submit(_tarea_navegar_a_url, url).result()
 
 def _tarea_hacer_clic_web(elemento: str) -> str:
     try:
@@ -166,8 +333,7 @@ def _tarea_hacer_clic_web(elemento: str) -> str:
         return f"No pude hacer clic en '{elemento}'."
 
 def hacer_clic_web(elemento: str) -> str:
-    future = executor_web.submit(_tarea_hacer_clic_web, elemento)
-    return future.result()
+    return executor_web.submit(_tarea_hacer_clic_web, elemento).result()
 
 def _tarea_escribir_y_buscar_web(texto: str) -> str:
     try:
@@ -180,5 +346,61 @@ def _tarea_escribir_y_buscar_web(texto: str) -> str:
         return "Ocurrió un error al escribir en la página."
 
 def escribir_y_buscar_web(texto: str) -> str:
-    future = executor_web.submit(_tarea_escribir_y_buscar_web, texto)
-    return future.result()
+    return executor_web.submit(_tarea_escribir_y_buscar_web, texto).result()
+
+def _tarea_reproducir_youtube(busqueda: str) -> str:
+    try:
+        page = _obtener_pagina_navegador(es_incognito=False)
+        url_busqueda = f"https://www.youtube.com/results?search_query={busqueda.replace(' ', '+')}"
+        
+        try:
+            # wait_until domcontentloaded previene el corte con net::ERR_ABORTED generado por scripts secundarios
+            page.goto(url_busqueda, timeout=25000, wait_until="domcontentloaded")
+        except Exception as e:
+            if "ERR_ABORTED" in str(e):
+                print(f"[Agente Web: Solicitud secundaria abortada tolerada en YouTube]")
+            else:
+                raise e
+        
+        try:
+            page.click('button[aria-label*="Aceptar"]', timeout=3000)
+        except Exception:
+            pass
+
+        page.wait_for_selector('ytd-video-renderer a#video-title', timeout=15000)
+        time.sleep(1)
+        primer_video = page.locator('ytd-video-renderer a#video-title').first
+        primer_video.click()
+        # Limpiar automáticamente pestañas iniciales vacías dejando solo la de YouTube
+        _limpiar_pestanas_iniciales_y_vacias()
+        return f"He buscado y reproducido el video sobre '{busqueda}' en YouTube exitosamente."
+    except Exception as e:
+        print(f"[Error del Agente Web (YouTube): {e}]")
+        return f"Ocurrió un error al reproducir YouTube: {e}"
+
+def buscar_y_reproducir_youtube(busqueda: str) -> str:
+    return executor_web.submit(_tarea_reproducir_youtube, busqueda).result()
+
+def _tarea_buscar_mercadolibre(producto: str) -> str:
+    try:
+        page = _obtener_pagina_navegador()
+        try:
+            page.goto("https://www.mercadolibre.cl/", timeout=25000, wait_until="domcontentloaded")
+        except Exception as e:
+            if "ERR_ABORTED" in str(e):
+                print(f"[Agente Web: Solicitud secundaria abortada tolerada en Mercado Libre]")
+            else:
+                raise e
+
+        page.wait_for_selector('input.cb1-edit', timeout=15000)
+        page.fill('input.cb1-edit', producto)
+        page.press('input.cb1-edit', 'Enter')
+        page.wait_for_selector('li.ui-search-layout__item', timeout=15000)
+        _limpiar_pestanas_iniciales_y_vacias()
+        return f"He realizado la búsqueda de '{producto}' en Mercado Libre."
+    except Exception as e:
+        print(f"[Error del Agente Web (Mercado Libre): {e}]")
+        return "Ocurrió un error al buscar en Mercado Libre."
+
+def buscar_mercadolibre(producto: str) -> str:
+    return executor_web.submit(_tarea_buscar_mercadolibre, producto).result()
